@@ -2,41 +2,49 @@
 # (advertises SmartBlind_DFU). Adapted from the Home Assistant community guide
 # "Local control of first-gen MySmartBlinds ... with ESPHome (no cloud)".
 #
-# Include it once per ESP32, defining these four substitutions in the device
-# config BEFORE the include:
-#
-#   substitutions:
-#     blind_id:   office                      # unique slug (a-z0-9_), used for IDs
-#     blind_name: "Office"                     # friendly name shown in HA
-#     blind_mac:  "aa:bb:cc:dd:ee:ff"          # ADVERTISED MAC (cloud MAC reversed)
-#     blind_key:  "000000000000"               # BLE key as hex, exactly as in the keys JSON
+# Add it to any existing ESP32 config, once per blind (up to 2 per device),
+# passing the blind's settings as package-local vars so several copies never
+# share substitutions:
 #
 #   packages:
-#     blind: !include blind.package.yaml
+#     blind_office:
+#       url: https://github.com/poldekch/mysmartblinds-esphome
+#       ref: main
+#       files:
+#         - path: blind.package.yaml
+#           vars:
+#             blind_id:   office               # unique slug (a-z0-9_), used for IDs
+#             blind_name: "Office"              # friendly name shown in HA
+#             blind_mac:  "aa:bb:cc:dd:ee:ff"   # ADVERTISED MAC (cloud MAC reversed)
+#             blind_key:  "000000000000"        # BLE key as hex, exactly as in the keys JSON
 #
-# Generate the substitutions (MAC reversed, key passed through) with:
+# (A local copy works the same way: `blind_office: !include { file:
+# blind.package.yaml, vars: {...} }`.)
+#
+# Each blind holds one BLE connection while it moves. Keep
+#   (number of blinds) + bluetooth_proxy.connection_slots <= esp32_ble.max_connections
+# (default 3) — see the README for a table.
+#
+# Generate the values (MAC reversed, key passed through) with:
 #   python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
 #
 # The key is split into bytes at runtime by the lambda below, and the MAC must
 # be the advertised (reversed) one because ESPHome resolves ble_client at
 # compile time and cannot reverse it for you — the generator does that.
 #
+# Every ID below is prefixed with ${blind_id}, and the only shared component
+# (esp32_ble_tracker) is declared empty, so this package merges cleanly with a
+# device that already runs bluetooth_proxy / esp32_ble_tracker with its own
+# settings — the device config always wins.
+#
 # Protocol (verified on hardware): write the key to characteristic 00001409,
 # then one position byte to 00001403 under service 00001400. Position is
 # 100 = flat/open, 200 = closed; tilt maps as 200 - tilt*100. The motor is
 # open-loop (no reliable position read), hence assumed_state below.
 
-esp32_ble_tracker:
-  scan_parameters:
-    active: false        # these motors don't need an active scan to connect
-
-# Set the motor's address type to RANDOM at boot; without this the client dials
-# it as a public address and never connects.
-esphome:
-  on_boot:
-    - priority: -100
-      then:
-        - lambda: 'id(${blind_id}_ble).set_remote_addr_type(BLE_ADDR_TYPE_RANDOM);'
+# Required by ble_client. Left empty on purpose: scan settings belong to the
+# device config (e.g. a bluetooth_proxy), not to this package.
+esp32_ble_tracker: {}
 
 globals:
   # Target position byte for the next move (100 open .. 200 closed).
@@ -95,7 +103,13 @@ script:
                 condition:
                   lambda: 'return !id(${blind_id}_done);'
                 then:
-                  - lambda: 'id(${blind_id}_ble).connect();'
+                  # The motor uses a RANDOM address; without this the client
+                  # dials it as public and never connects. Set right before
+                  # each connect (instead of in esphome.on_boot) so the package
+                  # doesn't touch the device's esphome: block.
+                  - lambda: |-
+                      id(${blind_id}_ble).set_remote_addr_type(BLE_ADDR_TYPE_RANDOM);
+                      id(${blind_id}_ble).connect();
                   - wait_until:
                       condition:
                         lambda: 'return id(${blind_id}_done);'
@@ -116,6 +130,7 @@ script:
 
 cover:
   - platform: template
+    id: ${blind_id}_cover
     name: "${blind_name}"
     device_class: blind
     assumed_state: true      # open-loop motor: HA can't read true position back

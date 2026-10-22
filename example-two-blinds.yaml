@@ -1,0 +1,59 @@
+# Example: an existing ESP32 node (here a Bluetooth proxy) with TWO independent
+# blinds. The package is pulled from GitHub once per blind, each with its own
+# vars, so the blinds share nothing but the radio: separate IDs, scripts,
+# retries and Home Assistant entities.
+
+esphome:
+  name: bedroom-proxy
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+ota:
+  - platform: esphome
+logger:
+
+# --- your existing BLE setup; the package never overrides it ---
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+# BLE connection budget: blinds + proxy connection_slots <= max_connections.
+# 2 blinds + 1 proxy slot = 3, which fits the ESP32 default of 3.
+# (Alternative: keep 3 proxy slots and set esp32_ble: max_connections: 5.)
+bluetooth_proxy:
+  active: true
+  connection_slots: 1
+
+# --- the blinds ---
+packages:
+  blind_left:
+    url: https://github.com/poldekch/mysmartblinds-esphome
+    ref: main
+    refresh: 1d
+    files:
+      - path: blind.package.yaml
+        vars:
+          blind_id: bedroom_left
+          blind_name: "Bedroom Left Blind"
+          blind_mac: "aa:bb:cc:dd:ee:01"
+          blind_key: "000000000000"
+
+  blind_right:
+    url: https://github.com/poldekch/mysmartblinds-esphome
+    ref: main
+    refresh: 1d
+    files:
+      - path: blind.package.yaml
+        vars:
+          blind_id: bedroom_right
+          blind_name: "Bedroom Right Blind"
+          blind_mac: "aa:bb:cc:dd:ee:02"
+          blind_key: "111111111111"

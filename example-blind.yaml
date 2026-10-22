@@ -1,18 +1,16 @@
-# Example per-ESP32 config for one blind. Copy this (and blind.package.yaml)
-# into your ESPHome directory, one file per node, and replace the substitutions
-# block with the one the generator prints for that blind:
+# Example: an existing ESP32 node (here a Bluetooth proxy) with ONE blind added.
+# The package is pulled straight from GitHub; replace the vars with the values
+# the generator prints for your blind:
 #
 #   python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
-#
-# Everything blind-specific lives in blind.package.yaml, so to add a feature
-# (battery from 00001651, a speed control, etc.) you edit that one file and all
-# nodes inherit it.
 
 esphome:
-  name: blind-office
+  name: living-room-proxy
 
 esp32:
   board: esp32dev
+  framework:
+    type: esp-idf
 
 wifi:
   ssid: !secret wifi_ssid
@@ -23,12 +21,28 @@ ota:
   - platform: esphome
 logger:
 
-# --- paste the generated block for THIS node below ---
-substitutions:
-  blind_id: office
-  blind_name: "Office"
-  blind_mac: "aa:bb:cc:dd:ee:ff"
-  blind_key: "000000000000"
+# --- your existing BLE setup; the package never overrides it ---
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
 
+# BLE connection budget: blinds + proxy connection_slots <= max_connections.
+# 1 blind + 2 proxy slots = 3, which fits the ESP32 default of 3.
+# (Alternative: keep 3 proxy slots and set esp32_ble: max_connections: 4.)
+bluetooth_proxy:
+  active: true
+  connection_slots: 2
+
+# --- the blind ---
 packages:
-  blind: !include blind.package.yaml
+  blind_office:
+    url: https://github.com/poldekch/mysmartblinds-esphome
+    ref: main
+    refresh: 1d
+    files:
+      - path: blind.package.yaml
+        vars:
+          blind_id: office
+          blind_name: "Office Blind"
+          blind_mac: "aa:bb:cc:dd:ee:ff"
+          blind_key: "000000000000"
