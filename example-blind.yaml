@@ -1,0 +1,34 @@
+# Example per-ESP32 config for one blind. Copy this (and blind.package.yaml)
+# into your ESPHome directory, one file per node, and replace the substitutions
+# block with the one the generator prints for that blind:
+#
+#   python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
+#
+# Everything blind-specific lives in blind.package.yaml, so to add a feature
+# (battery from 00001651, a speed control, etc.) you edit that one file and all
+# nodes inherit it.
+
+esphome:
+  name: blind-office
+
+esp32:
+  board: esp32dev
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+ota:
+  - platform: esphome
+logger:
+
+# --- paste the generated block for THIS node below ---
+substitutions:
+  blind_id: office
+  blind_name: "Office"
+  blind_mac: "aa:bb:cc:dd:ee:ff"
+  blind_key: "000000000000"
+
+packages:
+  blind: !include blind.package.yaml

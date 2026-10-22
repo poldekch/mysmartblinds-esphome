@@ -1,0 +1,133 @@
+# Reusable ESPHome driver for ONE first-gen MySmartBlinds / Tilt motor
+# (advertises SmartBlind_DFU). Adapted from the Home Assistant community guide
+# "Local control of first-gen MySmartBlinds ... with ESPHome (no cloud)".
+#
+# Include it once per ESP32, defining these four substitutions in the device
+# config BEFORE the include:
+#
+#   substitutions:
+#     blind_id:   office                      # unique slug (a-z0-9_), used for IDs
+#     blind_name: "Office"                     # friendly name shown in HA
+#     blind_mac:  "aa:bb:cc:dd:ee:ff"          # ADVERTISED MAC (cloud MAC reversed)
+#     blind_key:  "000000000000"               # BLE key as hex, exactly as in the keys JSON
+#
+#   packages:
+#     blind: !include blind.package.yaml
+#
+# Generate the substitutions (MAC reversed, key passed through) with:
+#   python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
+#
+# The key is split into bytes at runtime by the lambda below, and the MAC must
+# be the advertised (reversed) one because ESPHome resolves ble_client at
+# compile time and cannot reverse it for you — the generator does that.
+#
+# Protocol (verified on hardware): write the key to characteristic 00001409,
+# then one position byte to 00001403 under service 00001400. Position is
+# 100 = flat/open, 200 = closed; tilt maps as 200 - tilt*100. The motor is
+# open-loop (no reliable position read), hence assumed_state below.
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: false        # these motors don't need an active scan to connect
+
+# Set the motor's address type to RANDOM at boot; without this the client dials
+# it as a public address and never connects.
+esphome:
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: 'id(${blind_id}_ble).set_remote_addr_type(BLE_ADDR_TYPE_RANDOM);'
+
+globals:
+  # Target position byte for the next move (100 open .. 200 closed).
+  - id: ${blind_id}_target
+    type: uint8_t
+    restore_value: false
+    initial_value: '100'
+  # Set true by on_connect once the position write has gone out.
+  - id: ${blind_id}_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+ble_client:
+  - id: ${blind_id}_ble
+    mac_address: ${blind_mac}
+    auto_connect: false          # connect only on demand, freeing the radio
+    on_connect:
+      then:
+        - delay: 200ms
+        # 1. Authenticate: write the key to 00001409. The hex string is split
+        #    into bytes here so blind_key stays in the same format as the JSON.
+        - ble_client.ble_write:
+            id: ${blind_id}_ble
+            service_uuid: '00001400-1212-efde-1600-785feabcd123'
+            characteristic_uuid: '00001409-1212-efde-1600-785feabcd123'
+            value: !lambda |-
+              const std::string hex = "${blind_key}";
+              std::vector<uint8_t> out;
+              for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                out.push_back((uint8_t) strtol(hex.substr(i, 2).c_str(), nullptr, 16));
+              }
+              return out;
+        # 2. Move: write the single target position byte to 00001403.
+        - ble_client.ble_write:
+            id: ${blind_id}_ble
+            service_uuid: '00001400-1212-efde-1600-785feabcd123'
+            characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+            value: !lambda 'return { id(${blind_id}_target) };'
+        - delay: 500ms
+        - lambda: 'id(${blind_id}_done) = true;'
+        - ble_client.disconnect:
+            id: ${blind_id}_ble
+
+script:
+  # Connect -> (on_connect writes key+position) -> wait for done -> retry.
+  # mode: restart so a new command supersedes one still in flight.
+  - id: ${blind_id}_send
+    mode: restart
+    then:
+      - lambda: 'id(${blind_id}_done) = false;'
+      - repeat:
+          count: 3
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(${blind_id}_done);'
+                then:
+                  - lambda: 'id(${blind_id}_ble).connect();'
+                  - wait_until:
+                      condition:
+                        lambda: 'return id(${blind_id}_done);'
+                      timeout: 12s
+                  - if:
+                      condition:
+                        lambda: 'return !id(${blind_id}_done);'
+                      then:
+                        - lambda: 'id(${blind_id}_ble).disconnect();'
+                        - delay: 1s
+      - if:
+          condition:
+            lambda: 'return !id(${blind_id}_done);'
+          then:
+            - logger.log:
+                format: "%s: move failed after 3 tries"
+                args: ['"${blind_name}"']
+
+cover:
+  - platform: template
+    name: "${blind_name}"
+    device_class: blind
+    assumed_state: true      # open-loop motor: HA can't read true position back
+    optimistic: true
+    has_position: false
+    open_action:
+      - lambda: 'id(${blind_id}_target) = 100;'
+      - script.execute: ${blind_id}_send
+    close_action:
+      - lambda: 'id(${blind_id}_target) = 200;'
+      - script.execute: ${blind_id}_send
+    tilt_action:
+      # tilt is 0.0 (closed) .. 1.0 (open); byte is 200 (closed) .. 100 (flat).
+      - lambda: 'id(${blind_id}_target) = (uint8_t) (200 - (int) (tilt * 100));'
+      - script.execute: ${blind_id}_send
