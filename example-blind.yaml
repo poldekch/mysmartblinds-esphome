@@ -1,8 +1,7 @@
 # Example: an existing ESP32 node (here a Bluetooth proxy) with ONE blind added.
-# The package is pulled straight from GitHub; replace the vars with the values
-# the generator prints for your blind:
-#
-#   python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
+# The package is pulled straight from GitHub; replace the vars with the blind's
+# "mac" and "key" from smartblinds-keys.json (smartblinds-import-cloud), copied
+# unchanged — the package reverses the MAC and splits the key itself.
 
 esphome:
   name: living-room-proxy

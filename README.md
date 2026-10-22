@@ -41,23 +41,40 @@ position ranges from `100` (flat/open) to `200` (closed), and tilt maps as
 
 ## Getting MAC and key
 
-You need each blind's **advertised** MAC (the cloud MAC with its bytes
-reversed) and its BLE key as hex. The generator from the original project
-prints both:
+Export every blind's MAC and key from the cloud with
+[smartblinds-ble](https://github.com/benbalter/smartblinds-ble), while the
+cloud is still online:
 
 ```sh
-python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
+pip install "smartblinds-ble[cloud]"
+smartblinds-import-cloud -o smartblinds-keys.json
 ```
 
-Put its output into the `vars:` block for each blind (`blind_mac`,
-`blind_key`).
+Each entry in `smartblinds-keys.json` looks like
+`{"name": ..., "mac": "AA:BB:CC:DD:EE:FF", "key": "0a1b2c3d", ...}`. Copy `mac`
+and `key` **as they are** into the `vars:` block for that blind. The package
+converts them itself:
+
+- **MAC.** The dump has the cloud MAC, whose bytes are in the reverse order
+  of the address the motor advertises. The package reverses it before
+  connecting, so `AA:BB:CC:DD:EE:FF` is dialled as `FF:EE:DD:CC:BB:AA`.
+  Don't reverse it yourself.
+- **Key.** The hex string is split into bytes in the same order: `0a1b2c3d`
+  is sent as `[0x0A, 0x1B, 0x2C, 0x3D]`, which is the byte list the forum
+  example writes by hand. That list format (`"0x0A, 0x1B, 0x2C, 0x3D"`) is
+  accepted as well. The key's length varies between blinds; send all of it.
 
 | var          | meaning                                                  |
 |--------------|----------------------------------------------------------|
 | `blind_id`   | unique slug (`a-z0-9_`) used for all IDs; must differ per blind |
 | `blind_name` | friendly name of the cover in Home Assistant             |
-| `blind_mac`  | advertised (reversed) MAC, e.g. `"aa:bb:cc:dd:ee:ff"`    |
-| `blind_key`  | BLE key as hex, exactly as in the keys JSON              |
+| `blind_mac`  | `mac` from the keys dump, unchanged, e.g. `"AA:BB:CC:DD:EE:FF"` |
+| `blind_key`  | `key` from the keys dump, unchanged, e.g. `"0a1b2c3d"`   |
+
+To check the conversion, open the device logs while moving a blind. You should
+see `Connecting to FF:EE:DD:CC:BB:AA (dump MAC AA:BB:CC:DD:EE:FF reversed)`
+followed by `Sending N-byte key`. The first address should match the
+`SmartBlind_DFU` device in a BLE scanner app such as nRF Connect.
 
 ## Usage
 

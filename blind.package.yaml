@@ -15,8 +15,8 @@
 #           vars:
 #             blind_id:   office               # unique slug (a-z0-9_), used for IDs
 #             blind_name: "Office"              # friendly name shown in HA
-#             blind_mac:  "aa:bb:cc:dd:ee:ff"   # ADVERTISED MAC (cloud MAC reversed)
-#             blind_key:  "000000000000"        # BLE key as hex, exactly as in the keys JSON
+#             blind_mac:  "aa:bb:cc:dd:ee:ff"   # MAC exactly as in the keys dump
+#             blind_key:  "000000000000"        # key exactly as in the keys dump
 #
 # (A local copy works the same way: `blind_office: !include { file:
 # blind.package.yaml, vars: {...} }`.)
@@ -25,12 +25,14 @@
 #   (number of blinds) + bluetooth_proxy.connection_slots <= esp32_ble.max_connections
 # (default 3) — see the README for a table.
 #
-# Generate the values (MAC reversed, key passed through) with:
-#   python -m smartblinds_ble.tools.control --esphome smartblinds-keys.json
-#
-# The key is split into bytes at runtime by the lambda below, and the MAC must
-# be the advertised (reversed) one because ESPHome resolves ble_client at
-# compile time and cannot reverse it for you — the generator does that.
+# Both values are copied straight from the smartblinds-ble keys dump
+# (smartblinds-import-cloud → smartblinds-keys.json); the package converts them:
+#   - MAC: the dump holds the cloud MAC, whose byte order is the reverse of the
+#     address the motor advertises (aa:bb:cc:dd:ee:ff → ff:ee:dd:cc:bb:aa). The
+#     send script reverses it and sets it on the client before every connect.
+#   - Key: hex in the dump's byte order, split into bytes in that same order
+#     (what the forum post writes as [0x.., 0x.., ...]). "0x" prefixes, spaces,
+#     commas and colons are ignored, so the forum-style list works too.
 #
 # Every ID below is prefixed with ${blind_id}, and the only shared component
 # (esp32_ble_tracker) is declared empty, so this package merges cleanly with a
@@ -60,23 +62,34 @@ globals:
 
 ble_client:
   - id: ${blind_id}_ble
+    # Placeholder only: the send script replaces it with the reversed
+    # (advertised) address before each connect.
     mac_address: ${blind_mac}
     auto_connect: false          # connect only on demand, freeing the radio
     on_connect:
       then:
         - delay: 200ms
-        # 1. Authenticate: write the key to 00001409. The hex string is split
-        #    into bytes here so blind_key stays in the same format as the JSON.
+        # 1. Authenticate: write the key to 00001409. The hex digits are paired
+        #    into bytes in order; "0x" prefixes and separators are skipped.
         - ble_client.ble_write:
             id: ${blind_id}_ble
             service_uuid: '00001400-1212-efde-1600-785feabcd123'
             characteristic_uuid: '00001409-1212-efde-1600-785feabcd123'
             value: !lambda |-
-              const std::string hex = "${blind_key}";
+              const std::string raw = "${blind_key}";
+              std::string hex;
+              for (size_t i = 0; i < raw.size(); i++) {
+                if (raw[i] == '0' && i + 1 < raw.size() && (raw[i + 1] == 'x' || raw[i + 1] == 'X')) {
+                  i++;
+                  continue;
+                }
+                if (isxdigit((unsigned char) raw[i])) hex += raw[i];
+              }
               std::vector<uint8_t> out;
               for (size_t i = 0; i + 1 < hex.size(); i += 2) {
                 out.push_back((uint8_t) strtol(hex.substr(i, 2).c_str(), nullptr, 16));
               }
+              ESP_LOGD("${blind_id}", "Sending %u-byte key", (unsigned) out.size());
               return out;
         # 2. Move: write the single target position byte to 00001403.
         - ble_client.ble_write:
@@ -103,12 +116,38 @@ script:
                 condition:
                   lambda: 'return !id(${blind_id}_done);'
                 then:
-                  # The motor uses a RANDOM address; without this the client
-                  # dials it as public and never connects. Set right before
-                  # each connect (instead of in esphome.on_boot) so the package
-                  # doesn't touch the device's esphome: block.
+                  # Dial the advertised address: the dump's MAC with its byte
+                  # order reversed. The motor uses a RANDOM address type;
+                  # without it the client dials a public address and never
+                  # connects. Both are set right before each connect (instead
+                  # of in esphome.on_boot) so the package doesn't touch the
+                  # device's esphome: block, and a disconnect that clears the
+                  # address can't break the next attempt.
                   - lambda: |-
+                      const std::string mac = "${blind_mac}";
+                      uint64_t addr = 0;
+                      int nibbles = 0;
+                      uint8_t byte = 0;
+                      for (char c : mac) {
+                        if (!isxdigit((unsigned char) c)) continue;
+                        byte = (byte << 4) | (uint8_t) strtol(std::string(1, c).c_str(), nullptr, 16);
+                        if (++nibbles % 2 == 0) {
+                          // Byte n of the dump becomes byte n from the END of
+                          // the advertised address.
+                          addr |= (uint64_t) byte << (8 * (nibbles / 2 - 1));
+                          byte = 0;
+                        }
+                      }
+                      if (nibbles != 12) {
+                        ESP_LOGE("${blind_id}", "blind_mac '%s' is not a 6-byte MAC", mac.c_str());
+                        return;
+                      }
+                      id(${blind_id}_ble).set_address(addr);
                       id(${blind_id}_ble).set_remote_addr_type(BLE_ADDR_TYPE_RANDOM);
+                      ESP_LOGI("${blind_id}", "Connecting to %02X:%02X:%02X:%02X:%02X:%02X (dump MAC %s reversed)",
+                               (unsigned) (addr >> 40) & 0xFF, (unsigned) (addr >> 32) & 0xFF,
+                               (unsigned) (addr >> 24) & 0xFF, (unsigned) (addr >> 16) & 0xFF,
+                               (unsigned) (addr >> 8) & 0xFF, (unsigned) addr & 0xFF, mac.c_str());
                       id(${blind_id}_ble).connect();
                   - wait_until:
                       condition:
