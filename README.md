@@ -16,12 +16,29 @@ For each blind you include, the package creates:
 - a send script that connects, authenticates with the blind's key, writes the
   target position, disconnects, and retries up to 3 times. If a new command
   arrives during a move, it replaces the old one
+- **battery and sensor entities**, read from the motor's indications on every
+  connection (see [Sensors](#sensors)): battery %, solar charging, the
+  motor's reported position, a raw light level, and raw diagnostic values
+- a **Refresh sensors** button and a **Sensor refresh interval** setting
+  (default 6 h), so the sensors stay current between moves
 
-Protocol (verified on hardware): the key goes to characteristic `00001409`,
-then a single position byte goes to `00001403` (service `00001400`). The
-position ranges from `100` (flat/open) to `200` (closed), and tilt maps as
-`200 - tilt*100`. The motor has no reliable position feedback, so the cover is
-`assumed_state` / optimistic.
+Protocol (all characteristics share the base
+`xxxxxxxx-1212-efde-1600-785feabcd123`):
+
+| Characteristic | Direction | Meaning |
+|---|---|---|
+| `00001409` | write | pairing key; must be written first on every connection |
+| `00001403` | write | one position byte: `100` flat/open … `200` closed; tilt maps as `200 - tilt*100` |
+| `00001403` | indicate | a position byte (one motor reported `0x63` = 99); not yet known to follow wand or schedule moves |
+| `00001402` | indicate | status; bytes 0–3 are a little-endian bitfield: `0x00040000` solar charging, `0x00080000` USB charging |
+| `00001651` | indicate | 14 bytes: battery %, reserved, then six little-endian `uint16`: battery voltage, battery charge, solar-panel voltage, interior temperature, battery temperature, raw light |
+
+Key and position writes are verified on hardware. The indications come from
+a capture of the official Android app; as in the app, they are enabled only
+after the key has been written. Reading `00001402`/`00001404` directly does
+not return this data. Because it isn't yet known whether the `00001403`
+readback tracks moves made with the wand or the motor's schedules, the cover
+remains `assumed_state` / optimistic.
 
 ### Designed to drop into an existing device
 
@@ -75,6 +92,53 @@ To check the conversion, open the device logs while moving a blind. You should
 see `Connecting to FF:EE:DD:CC:BB:AA (dump MAC AA:BB:CC:DD:EE:FF reversed)`
 followed by `Sending N-byte key`. The first address should match the
 `SmartBlind_DFU` device in a BLE scanner app such as nRF Connect.
+
+## Sensors
+
+Every connection to the blind (each move, each scheduled refresh, each press
+of **Refresh sensors**) also reads its sensors. The values stay in Home
+Assistant between connections.
+
+| Entity (prefixed with `blind_name`) | Source | Default |
+|---|---|---|
+| Battery | `00001651` byte 0, % | enabled |
+| Solar charging | `00001402` bit `0x00040000` | enabled |
+| Reported position (raw) | `00001403` indication, 0–200 scale; not used by the cover (see above) | enabled |
+| Light level (raw) | `00001651` last `uint16`, not calibrated to lux | enabled |
+| Battery voltage (raw), Battery charge (raw), Solar panel voltage (raw), Interior temperature (raw), Battery temperature (raw) | `00001651` `uint16` fields, units not verified | disabled, diagnostic |
+| USB charging | `00001402` bit `0x00080000` | disabled, diagnostic |
+| Status flags | `00001402` bytes 0–3 as hex | disabled, diagnostic |
+| Refresh sensors | button: connect now and read the sensors | diagnostic |
+| Sensor refresh interval | hours between sensor-only connections, `0` = never | `6`, config |
+
+The disabled entities can be enabled from the device page in Home Assistant.
+
+**Battery cost.** Each connection wakes the motor's radio, so a short refresh
+interval costs motor battery. A move resets the timer, since it reads the
+sensors too. A refresh never interrupts a move. If the blind is unreachable,
+the next try waits a full interval.
+
+**Calibrating raw values.** Only battery % has known units. Once you have
+worked out a conversion, redeclare the sensor by its ID in your device config
+and add filters. ESPHome merges list entries that share an ID:
+
+```yaml
+sensor:
+  - id: office_light            # <blind_id>_light
+    filters:
+      - multiply: 0.5           # your own calibration
+    unit_of_measurement: lx
+```
+
+The IDs are `<blind_id>_battery`, `_light`, `_battery_voltage`,
+`_battery_charge`, `_solar_voltage`, `_interior_temp`, `_battery_temp` and
+`_reported_position`.
+
+**Logs.** Each indication is logged at `DEBUG` with its raw bytes (for
+example `0x1651: 64.00.…`), which helps when working out the units. If a motor
+lacks one of the characteristics, the log says
+`Characteristic 0x1651 not found` and those entities stay unknown; moving the
+blind is unaffected.
 
 ## Usage
 
@@ -176,7 +240,7 @@ is `esp32_ble: max_connections`, and it defaults to **3**. Two things use
 those connections:
 
 - **each blind**: 1 connection (`ble_client`), held only while the blind
-  moves
+  moves or refreshes its sensors (a few seconds)
 - **an active Bluetooth proxy**: `bluetooth_proxy: connection_slots`
   connections, which also defaults to 3
 
@@ -214,6 +278,8 @@ bluetooth_proxy:
 
 - **Framework.** ESP-IDF is recommended, and an active Bluetooth proxy needs
   it.
+- **Updating from an earlier version.** Nothing changes in your config; the
+  sensor, button and number entities simply appear after the update.
 - **Unique `blind_id`.** If two packages use the same `blind_id`, ESPHome
   merges them into one blind instead of reporting an error, so give each blind
   its own.

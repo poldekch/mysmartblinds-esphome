@@ -21,7 +21,8 @@
 # (A local copy works the same way: `blind_office: !include { file:
 # blind.package.yaml, vars: {...} }`.)
 #
-# Each blind holds one BLE connection while it moves. Keep
+# Each blind holds one BLE connection while it moves or refreshes its sensors.
+# Keep
 #   (number of blinds) + bluetooth_proxy.connection_slots <= esp32_ble.max_connections
 # (default 3) — see the README for a table.
 #
@@ -39,10 +40,26 @@
 # device that already runs bluetooth_proxy / esp32_ble_tracker with its own
 # settings — the device config always wins.
 #
-# Protocol (verified on hardware): write the key to characteristic 00001409,
-# then one position byte to 00001403 under service 00001400. Position is
-# 100 = flat/open, 200 = closed; tilt maps as 200 - tilt*100. The motor is
-# open-loop (no reliable position read), hence assumed_state below.
+# Protocol. All characteristics share the base xxxxxxxx-1212-efde-1600-785feabcd123.
+#   00001409  write the key first; nothing else works until it is written.
+#   00001403  write one position byte: 100 = flat/open, 200 = closed; tilt maps
+#             as 200 - tilt*100. The motor also indicates a byte here (one
+#             motor reported 0x63 = 99); whether it tracks wand/schedule moves
+#             is untested, so the cover stays optimistic / assumed_state and
+#             the value is only shown as a sensor, not used by the cover.
+#   00001402  status indication; bytes 0-3 are a little-endian bitfield:
+#             0x00040000 = solar charging, 0x00080000 = USB charging.
+#   00001651  power/sensor indication, 14 bytes: [0] battery %, [1] reserved,
+#             then six little-endian uint16: battery voltage, battery charge,
+#             solar-panel voltage, interior temperature, battery temperature,
+#             raw light. Only battery % is in known units; the rest are raw.
+# Indications are enabled (CCCD written) only AFTER the key, as the official
+# app does; the motor does not send 00001651 data otherwise. 00001651 is looked
+# up by its UUID across all services, so the guessed service UUID on its sensor
+# below doesn't affect whether it works.
+# Moves and sensor reads use the same connection: every move also refreshes the
+# sensors, and between moves the blind is polled on a schedule set by the
+# "Sensor refresh interval" number entity (0 = never; default 6 h).
 
 # Required by ble_client. Left empty on purpose: scan settings belong to the
 # device config (e.g. a bluetooth_proxy), not to this package.
@@ -54,11 +71,43 @@ globals:
     type: uint8_t
     restore_value: false
     initial_value: '100'
-  # Set true by on_connect once the position write has gone out.
+  # True while a move is waiting to be written; false = sensor refresh only.
+  - id: ${blind_id}_move_pending
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Set true by on_connect once the key (and position, if any) went out and
+  # the sensors had a chance to report.
   - id: ${blind_id}_done
     type: bool
     restore_value: false
     initial_value: 'false'
+  # True between the key write and the disconnect. Indications that arrive
+  # before the key is accepted are ignored.
+  - id: ${blind_id}_authed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Set when a 00001651 indication has been decoded on this connection.
+  - id: ${blind_id}_got_power
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # millis() of the last connection attempt (move or refresh); 0 = never.
+  - id: ${blind_id}_last_refresh
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Attribute handles found during service discovery, per connection.
+  # Characteristic value handles of 00001651 / 00001402 / 00001403 (0 = absent).
+  - id: ${blind_id}_handles
+    type: std::vector<uint16_t>
+    restore_value: false
+  # One entry per characteristic to subscribe: (CCCD handle << 16) | CCCD value
+  # (1 = notify, 2 = indicate).
+  - id: ${blind_id}_cccds
+    type: std::vector<uint32_t>
+    restore_value: false
 
 ble_client:
   - id: ${blind_id}_ble
@@ -68,6 +117,57 @@ ble_client:
     auto_connect: false          # connect only on demand, freeing the radio
     on_connect:
       then:
+        # 0. Runs synchronously inside service discovery, while the GATT cache
+        #    still exists (ESPHome frees it once every node is established).
+        #    Find the three indicating characteristics by UUID in ANY service,
+        #    register for their indications locally, and remember the CCCD
+        #    handles so they can be written after the key.
+        - lambda: |-
+            id(${blind_id}_authed) = false;
+            id(${blind_id}_got_power) = false;
+            auto *cl = id(${blind_id}_ble);
+            // 128-bit UUIDs in the stack's little-endian layout; bytes 12-13
+            // hold the 16-bit short ID (0x1651 etc.).
+            static const uint16_t shorts[3] = {0x1651, 0x1402, 0x1403};
+            std::vector<uint16_t> handles(3, 0);
+            std::vector<uint32_t> cccds;
+            for (int i = 0; i < 3; i++) {
+              esp_bt_uuid_t uuid = {};
+              uuid.len = ESP_UUID_LEN_128;
+              const uint8_t base[16] = {0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x00, 0x16,
+                                        0xde, 0xef, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00};
+              memcpy(uuid.uuid.uuid128, base, 16);
+              uuid.uuid.uuid128[12] = shorts[i] & 0xFF;
+              uuid.uuid.uuid128[13] = shorts[i] >> 8;
+              esp_gattc_char_elem_t chr;
+              uint16_t count = 1;
+              if (esp_ble_gattc_get_char_by_uuid(cl->get_gattc_if(), cl->get_conn_id(), 0x0001, 0xFFFF, uuid,
+                                                 &chr, &count) != ESP_GATT_OK || count == 0) {
+                ESP_LOGW("${blind_id}", "Characteristic 0x%04X not found; its sensors stay unavailable", shorts[i]);
+                continue;
+              }
+              handles[i] = chr.char_handle;
+              esp_bt_uuid_t cccd_uuid = {};
+              cccd_uuid.len = ESP_UUID_LEN_16;
+              cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+              esp_gattc_descr_elem_t descr;
+              count = 1;
+              if (esp_ble_gattc_get_descr_by_char_handle(cl->get_gattc_if(), cl->get_conn_id(), chr.char_handle,
+                                                         cccd_uuid, &descr, &count) != ESP_GATT_OK || count == 0) {
+                ESP_LOGW("${blind_id}", "Characteristic 0x%04X has no CCCD; cannot subscribe", shorts[i]);
+                continue;
+              }
+              uint16_t en = (chr.properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) ? 0x0002 : 0x0001;
+              cccds.push_back(((uint32_t) descr.handle << 16) | en);
+              // Tells the local stack to deliver indications for this handle.
+              // (ESPHome also writes the CCCD now; that pre-key write may be
+              // ignored by the motor, hence the second write after the key.)
+              cl->register_for_notify(chr.char_handle);
+              ESP_LOGD("${blind_id}", "0x%04X: value handle 0x%04X, CCCD 0x%04X, %s", shorts[i],
+                       chr.char_handle, descr.handle, en == 2 ? "indicate" : "notify");
+            }
+            id(${blind_id}_handles) = handles;
+            id(${blind_id}_cccds) = cccds;
         - delay: 200ms
         # 1. Authenticate: write the key to 00001409. The hex digits are paired
         #    into bytes in order; "0x" prefixes and separators are skipped.
@@ -91,24 +191,67 @@ ble_client:
               }
               ESP_LOGD("${blind_id}", "Sending %u-byte key", (unsigned) out.size());
               return out;
-        # 2. Move: write the single target position byte to 00001403.
-        - ble_client.ble_write:
-            id: ${blind_id}_ble
-            service_uuid: '00001400-1212-efde-1600-785feabcd123'
-            characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
-            value: !lambda 'return { id(${blind_id}_target) };'
-        - delay: 500ms
+        - delay: 200ms
+        # 2. Point the decoder sensors at the handles found above, then enable
+        #    indications now that the key is in (one CCCD write per step so
+        #    the stack never has two requests in flight).
+        - lambda: |-
+            id(${blind_id}_authed) = true;
+            auto &h = id(${blind_id}_handles);
+            id(${blind_id}_power_raw)->handle = h[0];
+            id(${blind_id}_status_raw)->handle = h[1];
+            id(${blind_id}_position_raw)->handle = h[2];
+        - repeat:
+            count: 3
+            then:
+              - lambda: |-
+                  auto &c = id(${blind_id}_cccds);
+                  if (iteration >= c.size()) return;
+                  auto *cl = id(${blind_id}_ble);
+                  uint16_t handle = c[iteration] >> 16;
+                  uint8_t value[2] = {(uint8_t) (c[iteration] & 0xFF), 0x00};
+                  esp_err_t err = esp_ble_gattc_write_char_descr(cl->get_gattc_if(), cl->get_conn_id(), handle,
+                                                                 sizeof(value), value, ESP_GATT_WRITE_TYPE_RSP,
+                                                                 ESP_GATT_AUTH_REQ_NONE);
+                  if (err != ESP_OK) ESP_LOGW("${blind_id}", "Enabling indications at 0x%04X failed: %d", handle, err);
+              - delay: 100ms
+        # 3. Move, if a move is pending: write the target byte to 00001403.
+        - if:
+            condition:
+              lambda: 'return id(${blind_id}_move_pending);'
+            then:
+              - ble_client.ble_write:
+                  id: ${blind_id}_ble
+                  service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                  characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+                  value: !lambda 'return { id(${blind_id}_target) };'
+              - lambda: 'id(${blind_id}_move_pending) = false;'
+              - delay: 500ms
+        # 4. Give the motor a moment to send its 00001651 reading (skipped if
+        #    this motor doesn't have that characteristic).
+        - wait_until:
+            condition:
+              lambda: 'return id(${blind_id}_got_power) || id(${blind_id}_handles)[0] == 0;'
+            timeout: 3s
         - lambda: 'id(${blind_id}_done) = true;'
         - ble_client.disconnect:
             id: ${blind_id}_ble
+    on_disconnect:
+      then:
+        - lambda: 'id(${blind_id}_authed) = false;'
 
 script:
-  # Connect -> (on_connect writes key+position) -> wait for done -> retry.
+  # Connect -> (on_connect writes key, enables indications, writes position if
+  # a move is pending, collects sensor data) -> wait for done -> retry.
   # mode: restart so a new command supersedes one still in flight.
   - id: ${blind_id}_send
     mode: restart
     then:
-      - lambda: 'id(${blind_id}_done) = false;'
+      # Restart the refresh timer on every attempt (successful or not), so an
+      # unreachable blind is retried at the refresh interval, not every minute.
+      - lambda: |-
+          id(${blind_id}_done) = false;
+          id(${blind_id}_last_refresh) = std::max<uint32_t>(1, millis());
       - repeat:
           count: 3
           then:
@@ -152,7 +295,7 @@ script:
                   - wait_until:
                       condition:
                         lambda: 'return id(${blind_id}_done);'
-                      timeout: 12s
+                      timeout: 15s
                   - if:
                       condition:
                         lambda: 'return !id(${blind_id}_done);'
@@ -164,24 +307,255 @@ script:
             lambda: 'return !id(${blind_id}_done);'
           then:
             - logger.log:
-                format: "%s: move failed after 3 tries"
-                args: ['"${blind_name}"']
+                format: "%s: %s failed after 3 tries"
+                args: ['"${blind_name}"', 'id(${blind_id}_move_pending) ? "move" : "sensor refresh"']
+
+  # Sensor refresh without moving. Never interrupts a move in progress (that
+  # move refreshes the sensors anyway).
+  - id: ${blind_id}_refresh
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(${blind_id}_send).is_running();'
+          then:
+            - script.execute: ${blind_id}_send
 
 cover:
   - platform: template
     id: ${blind_id}_cover
     name: "${blind_name}"
     device_class: blind
-    assumed_state: true      # open-loop motor: HA can't read true position back
+    assumed_state: true      # no verified position feedback; see 00001403 above
     optimistic: true
     has_position: false
     open_action:
-      - lambda: 'id(${blind_id}_target) = 100;'
+      - lambda: |-
+          id(${blind_id}_target) = 100;
+          id(${blind_id}_move_pending) = true;
       - script.execute: ${blind_id}_send
     close_action:
-      - lambda: 'id(${blind_id}_target) = 200;'
+      - lambda: |-
+          id(${blind_id}_target) = 200;
+          id(${blind_id}_move_pending) = true;
       - script.execute: ${blind_id}_send
     tilt_action:
       # tilt is 0.0 (closed) .. 1.0 (open); byte is 200 (closed) .. 100 (flat).
-      - lambda: 'id(${blind_id}_target) = (uint8_t) (200 - (int) (tilt * 100));'
+      - lambda: |-
+          id(${blind_id}_target) = (uint8_t) (200 - (int) (tilt * 100));
+          id(${blind_id}_move_pending) = true;
       - script.execute: ${blind_id}_send
+
+sensor:
+  # --- Decoders (internal). They only receive indications; on_connect points
+  # them at the handles it found. Each publishes to the template sensors below,
+  # which keep their value while the blind is disconnected (a ble_client sensor
+  # itself drops to "unknown" on every disconnect).
+  - platform: ble_client
+    type: characteristic
+    id: ${blind_id}_power_raw
+    internal: true
+    ble_client_id: ${blind_id}_ble
+    # Guess: 00001651 is assumed to live in service 00001650. If that's wrong
+    # you only get a "No sensor characteristic found" warning; on_connect finds
+    # the characteristic by UUID regardless.
+    service_uuid: '00001650-1212-efde-1600-785feabcd123'
+    characteristic_uuid: '00001651-1212-efde-1600-785feabcd123'
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (!id(${blind_id}_authed)) return NAN;
+      if (x.size() < 14) {
+        ESP_LOGW("${blind_id}", "0x1651: expected 14 bytes, got %u", (unsigned) x.size());
+        return NAN;
+      }
+      auto u16 = [&x](size_t i) -> float { return (float) (x[i] | (x[i + 1] << 8)); };
+      ESP_LOGD("${blind_id}", "0x1651: %s", format_hex_pretty(x).c_str());
+      id(${blind_id}_battery).publish_state(x[0]);
+      id(${blind_id}_battery_voltage).publish_state(u16(2));
+      id(${blind_id}_battery_charge).publish_state(u16(4));
+      id(${blind_id}_solar_voltage).publish_state(u16(6));
+      id(${blind_id}_interior_temp).publish_state(u16(8));
+      id(${blind_id}_battery_temp).publish_state(u16(10));
+      id(${blind_id}_light).publish_state(u16(12));
+      id(${blind_id}_got_power) = true;
+      return x[0];
+
+  - platform: ble_client
+    type: characteristic
+    id: ${blind_id}_status_raw
+    internal: true
+    ble_client_id: ${blind_id}_ble
+    service_uuid: '00001400-1212-efde-1600-785feabcd123'
+    characteristic_uuid: '00001402-1212-efde-1600-785feabcd123'
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (!id(${blind_id}_authed)) return NAN;
+      if (x.size() < 4) {
+        ESP_LOGW("${blind_id}", "0x1402: expected at least 4 bytes, got %u", (unsigned) x.size());
+        return NAN;
+      }
+      uint32_t flags = (uint32_t) x[0] | ((uint32_t) x[1] << 8) | ((uint32_t) x[2] << 16) | ((uint32_t) x[3] << 24);
+      ESP_LOGD("${blind_id}", "0x1402: %s (flags 0x%08X)", format_hex_pretty(x).c_str(), (unsigned) flags);
+      id(${blind_id}_solar_charging).publish_state(flags & 0x00040000);
+      id(${blind_id}_usb_charging).publish_state(flags & 0x00080000);
+      char buf[11];
+      snprintf(buf, sizeof(buf), "0x%08X", (unsigned) flags);
+      id(${blind_id}_status_flags).publish_state(buf);
+      return NAN;
+
+  - platform: ble_client
+    type: characteristic
+    id: ${blind_id}_position_raw
+    internal: true
+    ble_client_id: ${blind_id}_ble
+    service_uuid: '00001400-1212-efde-1600-785feabcd123'
+    characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+    notify: true
+    update_interval: never
+    lambda: |-
+      if (!id(${blind_id}_authed) || x.empty()) return NAN;
+      ESP_LOGD("${blind_id}", "0x1403: %u", (unsigned) x[0]);
+      id(${blind_id}_reported_position).publish_state(x[0]);
+      return NAN;
+
+  # --- Entities shown in Home Assistant. They keep their last value between
+  # connections. Only battery % has verified units; the others are the raw
+  # 16-bit values the motor sends. To calibrate one, redeclare it by id in your
+  # device config and add filters (ESPHome merges list items with the same id).
+  - platform: template
+    id: ${blind_id}_battery
+    name: "${blind_name} Battery"
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: ${blind_id}_light
+    name: "${blind_name} Light level (raw)"
+    icon: mdi:brightness-5
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: ${blind_id}_battery_voltage
+    name: "${blind_name} Battery voltage (raw)"
+    icon: mdi:flash-triangle
+    entity_category: diagnostic
+    disabled_by_default: true
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: ${blind_id}_battery_charge
+    name: "${blind_name} Battery charge (raw)"
+    icon: mdi:battery-charging
+    entity_category: diagnostic
+    disabled_by_default: true
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: ${blind_id}_solar_voltage
+    name: "${blind_name} Solar panel voltage (raw)"
+    icon: mdi:solar-panel
+    entity_category: diagnostic
+    disabled_by_default: true
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: ${blind_id}_interior_temp
+    name: "${blind_name} Interior temperature (raw)"
+    icon: mdi:thermometer
+    entity_category: diagnostic
+    disabled_by_default: true
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: ${blind_id}_battery_temp
+    name: "${blind_name} Battery temperature (raw)"
+    icon: mdi:thermometer
+    entity_category: diagnostic
+    disabled_by_default: true
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+  # Byte the motor indicates on 00001403 (0-200 scale). Shown for information
+  # only: it is not yet known whether it follows wand or schedule moves, so the
+  # cover does not use it.
+  - platform: template
+    id: ${blind_id}_reported_position
+    name: "${blind_name} Reported position (raw)"
+    icon: mdi:blinds
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    id: ${blind_id}_solar_charging
+    name: "${blind_name} Solar charging"
+    device_class: battery_charging
+    icon: mdi:solar-power
+  - platform: template
+    id: ${blind_id}_usb_charging
+    name: "${blind_name} USB charging"
+    device_class: battery_charging
+    icon: mdi:usb-port
+    entity_category: diagnostic
+    disabled_by_default: true
+
+text_sensor:
+  # First four bytes of the 00001402 status indication, for protocol research.
+  - platform: template
+    id: ${blind_id}_status_flags
+    name: "${blind_name} Status flags"
+    icon: mdi:flag
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
+
+button:
+  - platform: template
+    id: ${blind_id}_refresh_button
+    name: "${blind_name} Refresh sensors"
+    icon: mdi:refresh
+    entity_category: diagnostic
+    on_press:
+      - script.execute: ${blind_id}_refresh
+
+number:
+  # How often to connect just to read the sensors. Every connection costs the
+  # motor some battery; moves refresh the sensors too and reset this timer.
+  - platform: template
+    id: ${blind_id}_refresh_hours
+    name: "${blind_name} Sensor refresh interval"
+    icon: mdi:timer-refresh-outline
+    entity_category: config
+    unit_of_measurement: h
+    min_value: 0
+    max_value: 48
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 6
+
+interval:
+  # Checks once a minute whether a refresh is due. The first refresh happens
+  # about a minute after boot so the entities are filled in early.
+  - interval: 1min
+    then:
+      - if:
+          condition:
+            lambda: |-
+              float hours = id(${blind_id}_refresh_hours).state;
+              if (isnan(hours) || hours <= 0) return false;
+              uint32_t last = id(${blind_id}_last_refresh);
+              return last == 0 || millis() - last >= (uint32_t) (hours * 3600000.0f);
+          then:
+            - script.execute: ${blind_id}_refresh
