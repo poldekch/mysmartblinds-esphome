@@ -158,8 +158,9 @@ With it enabled:
 - **No nudge when it's already open.** If the blind isn't closed, moves go
   straight to their target.
 - **Visible in Home Assistant.** Every blind has a read-only **Sticky mode**
-  entity in its Diagnostic section, on when `sticky_blind: true`. Change the
-  setting in the YAML; it can't be toggled from Home Assistant.
+  entity in its Diagnostic section (disabled by default; enable it from the
+  device page), on when `sticky_blind: true`. Change the setting in the YAML;
+  it can't be toggled from Home Assistant.
 
 The package decides whether the blind is closed from the last position it
 knows: the motor's report from the most recent connection, or the target of

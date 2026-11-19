@@ -665,6 +665,7 @@ binary_sensor:
     name: "${blind_name} Sticky mode"
     icon: mdi:lock-open-alert
     entity_category: diagnostic
+    disabled_by_default: true
     lambda: 'return id(${blind_id}_margin) > 0;'
   - platform: template
     id: ${blind_id}_solar_charging
