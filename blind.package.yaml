@@ -657,6 +657,15 @@ sensor:
     update_interval: never
 
 binary_sensor:
+  # Read-only: shows whether sticky_blind is set in this blind's vars. It is a
+  # build-time setting (it also fixes the number ranges), so it can't be
+  # toggled from HA.
+  - platform: template
+    id: ${blind_id}_sticky_mode
+    name: "${blind_name} Sticky mode"
+    icon: mdi:lock-open-alert
+    entity_category: diagnostic
+    lambda: 'return id(${blind_id}_margin) > 0;'
   - platform: template
     id: ${blind_id}_solar_charging
     name: "${blind_name} Solar charging"
