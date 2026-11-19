@@ -17,6 +17,14 @@
 #             blind_name: "Office"              # friendly name shown in HA
 #             blind_mac:  "aa:bb:cc:dd:ee:ff"   # MAC exactly as in the keys dump
 #             blind_key:  "000000000000"        # key exactly as in the keys dump
+#             sticky_blind: true                # optional, default false (see below)
+#
+# sticky_blind: for a motor that sometimes jams when closed and only frees
+# itself after a small further move toward closed. When true, no move ever
+# goes closer than 3 steps to either end (0 -> 3, 200 -> 197, also enforced on
+# the Open/Close position settings), and opening from a closed blind first
+# nudges it to the full-close end on the side of the Close position setting
+# (0 or 200), waits 1 s, then moves to the target - all on one connection.
 #
 # (A local copy works the same way: `blind_office: !include { file:
 # blind.package.yaml, vars: {...} }`.)
@@ -68,7 +76,33 @@
 # device config (e.g. a bluetooth_proxy), not to this package.
 esp32_ble_tracker: {}
 
+# Default for the optional sticky_blind var. A package's own vars take
+# precedence over this, so each blind gets its own value.
+substitutions:
+  sticky_blind: "false"
+
 globals:
+  # Steps kept clear of each end: 3 for a sticky blind (sticky_blind: true),
+  # else 0. Moves are limited to [margin, 200 - margin].
+  - id: ${blind_id}_margin
+    type: int
+    restore_value: false
+    # Decided in C++ (globals need a string, and a Jinja expression here would
+    # turn into an integer). Accepts true / True / "true".
+    initial_value: 'strcasecmp("${sticky_blind}", "true") == 0 ? 3 : 0'
+  # Sticky blinds only: full-close position (0 or 200) to write before the
+  # target, followed by a 1 s pause; -1 = no nudge for this move.
+  - id: ${blind_id}_nudge
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  # Last position shown on the cover (reported by the motor, or the target of
+  # the latest move); -1 = unknown. Used to decide whether a sticky blind is
+  # currently closed.
+  - id: ${blind_id}_last_pos
+    type: int
+    restore_value: false
+    initial_value: '-1'
   # Target position byte for the next move (0 .. 200, 100 = flat).
   - id: ${blind_id}_target
     type: uint8_t
@@ -252,6 +286,21 @@ ble_client:
                   if (err != ESP_OK) ESP_LOGW("${blind_id}", "Enabling indications at 0x%04X failed: %d", handle, err);
               - delay: 100ms
         # 3. Move, if a move is pending: write the target byte to 00001403.
+        #    A sticky blind opening from closed is first nudged to full close
+        #    and given 1 s to free itself.
+        - if:
+            condition:
+              lambda: 'return id(${blind_id}_move_pending) && id(${blind_id}_nudge) >= 0;'
+            then:
+              - lambda: |-
+                  ESP_LOGI("${blind_id}", "Sticky blind: nudging to %d before moving to %u", id(${blind_id}_nudge),
+                           (unsigned) id(${blind_id}_target));
+              - ble_client.ble_write:
+                  id: ${blind_id}_ble
+                  service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                  characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+                  value: !lambda 'return { (uint8_t) id(${blind_id}_nudge) };'
+              - delay: 1s
         - if:
             condition:
               lambda: 'return id(${blind_id}_move_pending);'
@@ -261,7 +310,9 @@ ble_client:
                   service_uuid: '00001400-1212-efde-1600-785feabcd123'
                   characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
                   value: !lambda 'return { id(${blind_id}_target) };'
-              - lambda: 'id(${blind_id}_move_pending) = false;'
+              - lambda: |-
+                  id(${blind_id}_move_pending) = false;
+                  id(${blind_id}_nudge) = -1;
               - delay: 500ms
         # 4. Read 00001403 explicitly as well, so the reported position gets a
         #    value on every connection even if the motor doesn't indicate it.
@@ -364,15 +415,25 @@ script:
                 format: "%s: %s failed after 3 tries"
                 args: ['"${blind_name}"', 'id(${blind_id}_move_pending) ? "move" : "sensor refresh"']
 
-  # Move to a raw position byte (0..200). Shows it in the cover right away;
-  # the motor's own report replaces it after the next connection.
+  # Move to a raw position byte (0..200, limited to [margin, 200 - margin]).
+  # Shows it in the cover right away; the motor's own report replaces it after
+  # the next connection.
   - id: ${blind_id}_move
     mode: queued
     parameters:
       pos: int
     then:
       - lambda: |-
-          int p = std::max(0, std::min(200, pos));
+          const int m = id(${blind_id}_margin);
+          int p = std::max(m, std::min(200 - m, pos));
+          // Sticky blind: if it is closed (within 5 steps of an end) and this
+          // move opens it further, nudge to full close first, on the side of
+          // the Close position setting.
+          int last = id(${blind_id}_last_pos);
+          id(${blind_id}_nudge) = -1;
+          if (m > 0 && last >= 0 && (last <= 5 || last >= 195) && abs(p - 100) < abs(last - 100)) {
+            id(${blind_id}_nudge) = id(${blind_id}_close_pos) >= 100 ? 200 : 0;
+          }
           id(${blind_id}_target) = (uint8_t) p;
           id(${blind_id}_move_pending) = true;
           id(${blind_id}_show)->execute(p);
@@ -387,6 +448,7 @@ script:
       pos: int
     then:
       - lambda: |-
+          id(${blind_id}_last_pos) = pos;
           float tilt = 1.0f - fabsf((float) pos - 100.0f) / 100.0f;
           tilt = std::max(0.0f, std::min(1.0f, tilt));
           auto *c = id(${blind_id}_cover);
@@ -687,12 +749,15 @@ number:
     name: "${blind_name} Open position"
     icon: mdi:blinds-open
     entity_category: config
-    min_value: 0
-    max_value: 200
+    # A sticky blind keeps 3 steps clear of each end.
+    min_value: ${ 3 if (sticky_blind | string | lower) == "true" else 0 }
+    max_value: ${ 197 if (sticky_blind | string | lower) == "true" else 200 }
     step: 1
     mode: box
     update_interval: 60s
-    lambda: 'return id(${blind_id}_open_pos);'
+    lambda: |-
+      const int m = id(${blind_id}_margin);
+      return std::max(m, std::min(200 - m, id(${blind_id}_open_pos)));
     set_action:
       - lambda: 'id(${blind_id}_open_pos) = (int) x;'
       - component.update: ${blind_id}_open_position
@@ -701,12 +766,15 @@ number:
     name: "${blind_name} Close position"
     icon: mdi:blinds
     entity_category: config
-    min_value: 0
-    max_value: 200
+    # A sticky blind keeps 3 steps clear of each end (0 -> 3, 200 -> 197).
+    min_value: ${ 3 if (sticky_blind | string | lower) == "true" else 0 }
+    max_value: ${ 197 if (sticky_blind | string | lower) == "true" else 200 }
     step: 1
     mode: box
     update_interval: 60s
-    lambda: 'return id(${blind_id}_close_pos);'
+    lambda: |-
+      const int m = id(${blind_id}_margin);
+      return std::max(m, std::min(200 - m, id(${blind_id}_close_pos)));
     set_action:
       - lambda: 'id(${blind_id}_close_pos) = (int) x;'
       - component.update: ${blind_id}_close_position

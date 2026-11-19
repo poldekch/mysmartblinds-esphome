@@ -89,6 +89,7 @@ converts them itself:
 | `blind_name` | friendly name of the cover in Home Assistant             |
 | `blind_mac`  | `mac` from the keys dump, unchanged, e.g. `"AA:BB:CC:DD:EE:FF"` |
 | `blind_key`  | `key` from the keys dump, unchanged, e.g. `"0a1b2c3d"`   |
+| `sticky_blind` | optional, default `false`; `true` for a blind that jams when closed (see [Sticky blinds](#sticky-blinds)) |
 
 To check the conversion, open the device logs while moving a blind. You should
 see `Connecting to FF:EE:DD:CC:BB:AA (dump MAC AA:BB:CC:DD:EE:FF reversed)`
@@ -126,6 +127,41 @@ and "closed" within 5 steps of an end. It updates on every connection, so a
 wand move shows up at the next refresh. A move from Home Assistant shows the
 target immediately. Open and close stay available at all times, since the
 blind can be moved behind Home Assistant's back.
+
+### Sticky blinds
+
+Some motors occasionally jam in the closed position: Open does nothing, but a
+small further move toward closed frees them. Set `sticky_blind: true` in that
+blind's `vars:` (other blinds are unaffected):
+
+```yaml
+        vars:
+          blind_id: office
+          blind_name: "Office Blind"
+          blind_mac: "aa:bb:cc:dd:ee:ff"
+          blind_key: "000000000000"
+          sticky_blind: true
+```
+
+With it enabled:
+
+- **Closing stops 3 steps short of each end**: `200` becomes `197` and `0`
+  becomes `3`. This applies to the cover's close, the tilt slider and the
+  Close buttons. **Open position** and **Close position** only accept
+  `3`–`197`.
+- **Opening from closed nudges first.** If the blind is closed (within 5
+  steps of an end) and a move opens it (Open, the tilt slider or **Open
+  flat**), the package first moves it to full close on the side of **Close
+  position** (`200` if it is 100 or more, else `0`), waits 1 second, then
+  moves to the target. It all happens on one connection. The log shows
+  `Sticky blind: nudging to 200 before moving to 100`.
+- **No nudge when it's already open.** If the blind isn't closed, moves go
+  straight to their target.
+
+The package decides whether the blind is closed from the last position it
+knows: the motor's report from the most recent connection, or the target of
+the latest move. Right after a reboot, before the first refresh, that
+position is unknown, so the first Open doesn't nudge.
 
 ## Sensors
 

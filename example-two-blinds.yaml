@@ -51,6 +51,7 @@ packages:
           blind_name: "Bedroom Left Blind"
           blind_mac: "aa:bb:cc:dd:ee:01"
           blind_key: "000000000000"
+          # sticky_blind: true      # only for a blind that jams when closed
 
   blind_right:
     url: https://github.com/poldekch/mysmartblinds-esphome

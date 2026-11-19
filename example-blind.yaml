@@ -51,3 +51,4 @@ packages:
           blind_name: "Office Blind"
           blind_mac: "aa:bb:cc:dd:ee:ff"
           blind_key: "000000000000"
+          # sticky_blind: true      # only for a blind that jams when closed
