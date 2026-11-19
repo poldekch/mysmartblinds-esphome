@@ -88,8 +88,19 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
-  # Set when a 00001651 indication has been decoded on this connection.
-  - id: ${blind_id}_got_power
+  # Which characteristics have reported on this connection, and which ones
+  # are expected to (subscribed). Bit 0 = 00001651, 1 = 00001402, 2 = 00001403.
+  - id: ${blind_id}_got
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_expect
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  # Set while our explicit read of 00001403 is outstanding, so the decoder can
+  # log whether a value came from that read or from an indication.
+  - id: ${blind_id}_pos_read
     type: bool
     restore_value: false
     initial_value: 'false'
@@ -130,7 +141,10 @@ ble_client:
         #    handles so they can be written after the key.
         - lambda: |-
             id(${blind_id}_authed) = false;
-            id(${blind_id}_got_power) = false;
+            id(${blind_id}_got) = 0;
+            id(${blind_id}_expect) = 0;
+            id(${blind_id}_pos_read) = false;
+            uint8_t expect = 0;
             auto *cl = id(${blind_id}_ble);
             // 128-bit UUIDs in the stack's little-endian layout; bytes 12-13
             // hold the 16-bit short ID (0x1651 etc.).
@@ -165,6 +179,7 @@ ble_client:
               }
               uint16_t en = (chr.properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) ? 0x0002 : 0x0001;
               cccds.push_back(((uint32_t) descr.handle << 16) | en);
+              expect |= 1 << i;
               // Tells the local stack to deliver indications for this handle.
               // (ESPHome also writes the CCCD now; that pre-key write may be
               // ignored by the motor, hence the second write after the key.)
@@ -174,6 +189,7 @@ ble_client:
             }
             id(${blind_id}_handles) = handles;
             id(${blind_id}_cccds) = cccds;
+            id(${blind_id}_expect) = expect;
         - delay: 200ms
         # 1. Authenticate: write the key to 00001409. The hex digits are paired
         #    into bytes in order; "0x" prefixes and separators are skipped.
@@ -233,12 +249,30 @@ ble_client:
                   value: !lambda 'return { id(${blind_id}_target) };'
               - lambda: 'id(${blind_id}_move_pending) = false;'
               - delay: 500ms
-        # 4. Give the motor a moment to send its 00001651 reading (skipped if
-        #    this motor doesn't have that characteristic).
+        # 4. Read 00001403 explicitly as well, so the reported position gets a
+        #    value on every connection even if the motor doesn't indicate it.
+        - lambda: |-
+            uint16_t handle = id(${blind_id}_handles)[2];
+            if (handle == 0) return;
+            auto *cl = id(${blind_id}_ble);
+            id(${blind_id}_pos_read) = true;
+            esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
+            if (err != ESP_OK) {
+              id(${blind_id}_pos_read) = false;
+              ESP_LOGW("${blind_id}", "Reading 0x1403 failed: %d", err);
+            }
+        # 5. Wait until every subscribed characteristic has reported (not
+        #    just 00001651), so a refresh-only connection doesn't hang up
+        #    before the position arrives.
         - wait_until:
             condition:
-              lambda: 'return id(${blind_id}_got_power) || id(${blind_id}_handles)[0] == 0;'
+              lambda: 'return (id(${blind_id}_got) & id(${blind_id}_expect)) == id(${blind_id}_expect);'
             timeout: 3s
+        - lambda: |-
+            uint8_t missing = id(${blind_id}_expect) & ~id(${blind_id}_got);
+            if (missing)
+              ESP_LOGD("${blind_id}", "No data this connection from:%s%s%s", (missing & 1) ? " 0x1651" : "",
+                       (missing & 2) ? " 0x1402" : "", (missing & 4) ? " 0x1403" : "");
         - lambda: 'id(${blind_id}_done) = true;'
         - ble_client.disconnect:
             id: ${blind_id}_ble
@@ -384,7 +418,7 @@ sensor:
       id(${blind_id}_interior_temp).publish_state(u16(8));
       id(${blind_id}_battery_temp).publish_state(u16(10));
       id(${blind_id}_light).publish_state(u16(12));
-      id(${blind_id}_got_power) = true;
+      id(${blind_id}_got) |= 1;
       return x[0];
 
   - platform: ble_client
@@ -409,6 +443,7 @@ sensor:
       char buf[11];
       snprintf(buf, sizeof(buf), "0x%08X", (unsigned) flags);
       id(${blind_id}_status_flags).publish_state(buf);
+      id(${blind_id}_got) |= 2;
       return NAN;
 
   - platform: ble_client
@@ -422,8 +457,12 @@ sensor:
     update_interval: never
     lambda: |-
       if (!id(${blind_id}_authed) || x.empty()) return NAN;
-      ESP_LOGD("${blind_id}", "0x1403: %u", (unsigned) x[0]);
+      // Receives both indications and the explicit read issued in on_connect.
+      const char *src = id(${blind_id}_pos_read) ? "read" : "indication";
+      id(${blind_id}_pos_read) = false;
+      ESP_LOGD("${blind_id}", "0x1403 (%s): %s = %u", src, format_hex_pretty(x).c_str(), (unsigned) x[0]);
       id(${blind_id}_reported_position).publish_state(x[0]);
+      id(${blind_id}_got) |= 4;
       return NAN;
 
   # --- Entities shown in Home Assistant. They keep their last value between

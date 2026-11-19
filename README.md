@@ -146,7 +146,10 @@ The IDs are `<blind_id>_battery`, `_light`, `_battery_voltage`,
 example `0x1651: 64.00.…`), which helps when working out the units. If a motor
 lacks one of the characteristics, the log says
 `Characteristic 0x1651 not found` and those entities stay unknown; moving the
-blind is unaffected.
+blind is unaffected. `0x1403` is also read directly on every connection, and
+its log line says whether a value came from that `read` or from an
+`indication`. A connection that ends without hearing from a characteristic
+logs `No data this connection from: …`.
 
 ## Usage
 
