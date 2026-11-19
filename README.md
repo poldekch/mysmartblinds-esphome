@@ -20,7 +20,7 @@ For each blind you include, the package creates:
   connection (see [Sensors](#sensors)): battery %, solar charging, the
   motor's reported position, a raw light level, and raw diagnostic values
 - a **Refresh sensors** button and a **Sensor refresh interval** setting
-  (default 6 h), so the sensors stay current between moves
+  (default 10 min), so the sensors stay current between moves
 
 Protocol (all characteristics share the base
 `xxxxxxxx-1212-efde-1600-785feabcd123`):
@@ -109,14 +109,22 @@ Assistant between connections.
 | USB charging | `00001402` bit `0x00080000` | disabled, diagnostic |
 | Status flags | `00001402` bytes 0–3 as hex | disabled, diagnostic |
 | Refresh sensors | button: connect now and read the sensors | diagnostic |
-| Sensor refresh interval | hours between sensor-only connections, `0` = never | `6`, config |
+| Sensor refresh interval | minutes between sensor-only connections, `1`–`1440` (24 h) | `10`, config |
 
 The disabled entities can be enabled from the device page in Home Assistant.
 
-**Battery cost.** Each connection wakes the motor's radio, so a short refresh
-interval costs motor battery. A move resets the timer, since it reads the
+**Battery cost.** A refresh is a short BLE connection: connect, discover
+services, write the key, receive the indications, disconnect, which takes a
+few seconds. At the default 10 minutes that is 144 connections a day, roughly
+5–10 minutes of connected radio time in total, on top of the advertising the
+motor does anyway. On a solar-charged motor this should be small, but it
+hasn't been measured; watch the Battery entity for a few days, and raise the
+interval if it trends down. A move resets the timer, since it reads the
 sensors too. A refresh never interrupts a move. If the blind is unreachable,
 the next try waits a full interval.
+
+Each refresh also holds one of the ESP32's BLE connections for those few
+seconds (see [BLE connection slots](#ble-connection-slots)).
 
 **Calibrating raw values.** Only battery % has known units. Once you have
 worked out a conversion, redeclare the sensor by its ID in your device config

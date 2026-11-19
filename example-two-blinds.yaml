@@ -35,7 +35,7 @@ bluetooth_proxy:
 # --- the blinds ---
 # Each blind gets a cover plus battery, charging and light sensors, a
 # "Refresh sensors" button and a "Sensor refresh interval" setting (default
-# 6 h, 0 = off) — see the README's Sensors section.
+# 10 min, 1 min to 24 h) — see the README's Sensors section.
 packages:
   blind_left:
     url: https://github.com/poldekch/mysmartblinds-esphome

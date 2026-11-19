@@ -59,7 +59,7 @@
 # below doesn't affect whether it works.
 # Moves and sensor reads use the same connection: every move also refreshes the
 # sensors, and between moves the blind is polled on a schedule set by the
-# "Sensor refresh interval" number entity (0 = never; default 6 h).
+# "Sensor refresh interval" number entity (1-1440 min; default 10 min).
 
 # Required by ble_client. Left empty on purpose: scan settings belong to the
 # device config (e.g. a bluetooth_proxy), not to this package.
@@ -531,31 +531,36 @@ button:
 number:
   # How often to connect just to read the sensors. Every connection costs the
   # motor some battery; moves refresh the sensors too and reset this timer.
+  # (The id differs from the earlier hours-based version on purpose, so a
+  # stored "6" (hours) isn't restored as 6 minutes.)
   - platform: template
-    id: ${blind_id}_refresh_hours
+    id: ${blind_id}_refresh_minutes
     name: "${blind_name} Sensor refresh interval"
     icon: mdi:timer-refresh-outline
     entity_category: config
-    unit_of_measurement: h
-    min_value: 0
-    max_value: 48
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 1440           # 24 h
     step: 1
     mode: box
     optimistic: true
     restore_value: true
-    initial_value: 6
+    initial_value: 10
 
 interval:
-  # Checks once a minute whether a refresh is due. The first refresh happens
-  # about a minute after boot so the entities are filled in early.
-  - interval: 1min
+  # Checks every 10 s whether a refresh is due (fine enough for a 1-minute
+  # setting). The first refresh happens about a minute after boot so the
+  # entities are filled in early.
+  - interval: 10s
     then:
       - if:
           condition:
             lambda: |-
-              float hours = id(${blind_id}_refresh_hours).state;
-              if (isnan(hours) || hours <= 0) return false;
+              float minutes = id(${blind_id}_refresh_minutes).state;
+              if (isnan(minutes) || minutes < 1) return false;
+              uint32_t now = millis();
               uint32_t last = id(${blind_id}_last_refresh);
-              return last == 0 || millis() - last >= (uint32_t) (hours * 3600000.0f);
+              if (last == 0) return now >= 60000;
+              return now - last >= (uint32_t) (minutes * 60000.0f);
           then:
             - script.execute: ${blind_id}_refresh
