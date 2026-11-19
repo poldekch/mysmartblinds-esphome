@@ -31,7 +31,7 @@ Protocol (all characteristics share the base
 | Characteristic | Direction | Meaning |
 |---|---|---|
 | `00001409` | write | pairing key; must be written first on every connection |
-| `00001403` | write | one position byte: `100` flat/open, `200` closed one way, `0` closed the other way (the `0` side is from older community notes, not yet verified) |
+| `00001403` | write | one position byte: `100` flat/open, `0` and `200` closed in opposite directions |
 | `00001403` | read / indicate | the motor's position on the same scale; follows wand moves. Right after a move it returns the target until the motor finishes |
 | `00001402` | indicate | status; bytes 0–3 are a little-endian bitfield: `0x00040000` solar charging, `0x00080000` USB charging |
 | `00001651` | indicate | 14 bytes: battery %, reserved, then six little-endian 16-bit values: battery voltage, battery charge, solar-panel voltage, interior temperature, battery temperature, raw light |
@@ -98,10 +98,17 @@ followed by `Sending N-byte key`. The first address should match the
 ## Positions
 
 The motor takes one position byte from `0` to `200`. `100` is flat (fully
-open); `200` closes the slats one way and, according to older community
-notes, `0` closes them the other way. Which of the two is "top of the slats
-toward the room" and which is "toward the window" depends on how the blind is
-mounted, so try both and rename the buttons in Home Assistant if you like.
+open), and the two ends close the slats in opposite directions. Verified on
+hardware:
+
+| Position | Slats |
+|---|---|
+| `0` | closed, room edge of the slats **down** |
+| `100` | flat, fully open |
+| `200` | closed, room edge of the slats **up** |
+
+If your blind is mounted differently, check which way each end goes and
+rename the buttons in Home Assistant if you like.
 
 | Entity (prefixed with `blind_name`) | What it does | Default |
 |---|---|---|
@@ -109,7 +116,7 @@ mounted, so try both and rename the buttons in Home Assistant if you like.
 | the cover's **close** | moves to **Close position** | |
 | the cover's **tilt** slider | 100% = flat, 0% = closed toward the side of **Close position** | |
 | Open position | "smart open": e.g. `80` or `120` to angle the slats for more light | `100`, config |
-| Close position | "smart close": `200` for one direction, `0` (or `1`) for the other | `200`, config |
+| Close position | "smart close": `200` closes room edge up, `0` room edge down | `200`, config |
 | Close (0 side), Open flat, Close (200 side) | buttons: move straight to `0`, `100`, `200`, ignoring the settings | |
 | Reported position (raw) | the position the motor reports, `0`–`200` | enabled |
 
@@ -180,15 +187,13 @@ lacks one of the characteristics, the log says
 blind is unaffected. `0x1403` is also read directly on every connection, and
 its log line says whether a value came from that `read` or from an
 `indication`. A connection that ends without hearing from a characteristic
-logs `No data this connection from: …`. Once per boot the log also names
-the service each characteristic belongs to (`0x1651 is in service …`).
+logs `No data this connection from: …`.
 
-ESPHome itself logs a few warnings on every connection that are harmless
-here: `ble_sensor` reports `Disconnected!` because the blind disconnects on
-purpose, and `No sensor characteristic found at service 00001650…` because
-`0x1651`'s service isn't known yet (the package finds it by UUID anyway).
-The related `ble_client.sensor set Warning flag` line comes from the same
-cause. To hide the `ble_sensor` ones, add this to your device config:
+ESPHome itself logs a couple of warnings on every connection that are
+harmless here: `ble_sensor` reports `Disconnected!`, and `component` reports
+`ble_client.sensor set Warning flag`, both because the package disconnects
+on purpose after each move or refresh. To hide the `ble_sensor` ones, add
+this to your device config:
 
 ```yaml
 logger:

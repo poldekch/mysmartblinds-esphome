@@ -42,9 +42,9 @@
 #
 # Protocol. All characteristics share the base xxxxxxxx-1212-efde-1600-785feabcd123.
 #   00001409  write the key first; nothing else works until it is written.
-#   00001403  write one position byte: 100 = flat/open, 200 = closed one way,
-#             and (per the older pysmartblinds notes, not yet verified here)
-#             0 = closed the other way. Reading/indicating it returns the
+#   00001403  write one position byte: 100 = flat/open, 0 and 200 = closed
+#             in opposite directions (verified: 0 tips the room edge of the
+#             slats down, 200 tips it up). Reading/indicating it returns the
 #             motor's position on the same scale; it follows wand moves
 #             (verified: 131 after a wand move, 199 after closing to 200).
 #             Right after a move it returns the target until the motor
@@ -57,10 +57,9 @@
 #             raw light. Battery % is known; voltages look like mV and
 #             temperatures like 0.1 degC (plausible values, not verified);
 #             battery charge and light stay raw.
+# All three indicating characteristics live in service 00001400 (verified).
 # Indications are enabled (CCCD written) only AFTER the key, as the official
-# app does; the motor does not send 00001651 data otherwise. 00001651 is looked
-# up by its UUID across all services, so the guessed service UUID on its sensor
-# below doesn't affect whether it works.
+# app does; the motor does not send 00001651 data otherwise.
 # Moves and sensor reads use the same connection: every move also refreshes the
 # sensors, and between moves the blind is polled on a schedule set by the
 # "Sensor refresh interval" number entity (1-1440 min; default 10 min).
@@ -182,30 +181,6 @@ ble_client:
                 continue;
               }
               handles[i] = chr.char_handle;
-              // Log (once per boot) which service each characteristic is in,
-              // to pin down the service UUID for the decoder sensors.
-              static bool svc_logged[3] = {false, false, false};
-              if (!svc_logged[i]) {
-                esp_gattc_service_elem_t svc;
-                for (uint16_t off = 0;; off++) {
-                  uint16_t n = 1;
-                  if (esp_ble_gattc_get_service(cl->get_gattc_if(), cl->get_conn_id(), nullptr, &svc, &n, off) !=
-                          ESP_GATT_OK || n == 0)
-                    break;
-                  if (chr.char_handle < svc.start_handle || chr.char_handle > svc.end_handle) continue;
-                  svc_logged[i] = true;
-                  if (svc.uuid.len == ESP_UUID_LEN_16) {
-                    ESP_LOGI("${blind_id}", "0x%04X is in service 0x%04X", shorts[i], svc.uuid.uuid.uuid16);
-                  } else if (svc.uuid.len == ESP_UUID_LEN_128) {
-                    const uint8_t *u = svc.uuid.uuid.uuid128;
-                    ESP_LOGI("${blind_id}",
-                             "0x%04X is in service %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                             shorts[i], u[15], u[14], u[13], u[12], u[11], u[10], u[9], u[8], u[7], u[6], u[5], u[4],
-                             u[3], u[2], u[1], u[0]);
-                  }
-                  break;
-                }
-              }
               esp_bt_uuid_t cccd_uuid = {};
               cccd_uuid.len = ESP_UUID_LEN_16;
               cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
@@ -470,10 +445,7 @@ sensor:
     id: ${blind_id}_power_raw
     internal: true
     ble_client_id: ${blind_id}_ble
-    # Guess: 00001651 is assumed to live in service 00001650. If that's wrong
-    # you only get a "No sensor characteristic found" warning; on_connect finds
-    # the characteristic by UUID regardless.
-    service_uuid: '00001650-1212-efde-1600-785feabcd123'
+    service_uuid: '00001400-1212-efde-1600-785feabcd123'
     characteristic_uuid: '00001651-1212-efde-1600-785feabcd123'
     notify: true
     update_interval: never
@@ -655,7 +627,8 @@ button:
     on_press:
       - script.execute: ${blind_id}_refresh
   # Direct moves to the three fixed positions, regardless of the open/close
-  # settings. Which physical direction "0 side" and "200 side" are (slats'
+  # settings. On the blind this was verified on, 0 tips the room edge of the
+  # slats down and 200 tips it up; which way that faces (slats'
   # top toward the room or the window) depends on how the blind is mounted.
   - platform: template
     id: ${blind_id}_close_low_button
