@@ -14,11 +14,14 @@ For each blind you include, the package creates:
   including moves made with the wand (see [Positions](#positions))
 - configurable **open and close positions** ("smart" open/close, either
   closing direction) and buttons for the three fixed positions
+- **silent moves** that step the slats slowly over a configurable time, so the
+  motor doesn't wake anyone (see [Silent moves](#silent-moves)), plus Home
+  Assistant actions for fast and silent moves to any position
 - a `ble_client` that connects **only on demand**. It stays disconnected while
   idle, so the radio stays free for scanning and proxying
 - a send script that connects, authenticates with the blind's key, writes the
-  target position, disconnects, and retries up to 3 times. If a new command
-  arrives during a move, it replaces the old one
+  target position, disconnects, and retries up to 3 times. A new command that
+  arrives during a move replaces it, on the same connection if it is still open
 - **battery and sensor entities**, read from the motor's indications on every
   connection (see [Sensors](#sensors)): battery %, solar charging, the
   motor's reported position, a raw light level, and diagnostic values
@@ -166,6 +169,77 @@ The package decides whether the blind is closed from the last position it
 knows: the motor's report from the most recent connection, or the target of
 the latest move. Right after a reboot, before the first refresh, that
 position is unknown, so the first Open doesn't nudge.
+
+## Silent moves
+
+The motor has no slow mode of its own (none is known, at least), so a silent
+move is done by the ESP: it holds one connection and steps the position from
+where the motor is now to the target, a little at a time.
+
+| Entity / action (prefixed with `blind_name` / `blind_id`) | What it does | Default |
+|---|---|---|
+| Silent open | silent move to **Open position** | |
+| Silent close | silent move to **Close position** | |
+| Silent move duration | how long a silent move takes, whatever its distance: `15`–`1800` s | `100`, config |
+| action `<blind_id>_move` | fast move to any `position` (`0`–`200`) | |
+| action `<blind_id>_silent_move` | silent move to any `position` (`0`–`200`) | |
+
+**How the steps are worked out.** Each silent move starts by reading the
+motor's current position, then splits the distance into steps of at least 1
+unit, at most one every 0.5 s, spread evenly over the duration. For example:
+
+| Move | Duration | Steps |
+|---|---|---|
+| 80 → 197 | 100 s | 117 steps of 1, every 0.85 s |
+| 80 → 197 | 15 s | 30 steps of about 4, every 0.5 s |
+| 120 → 130 | 100 s | 10 steps of 1, every 10 s |
+
+While it runs, the cover shows *opening* or *closing* and its tilt follows
+each step. The log shows `Silent move 80 -> 197: 117 steps, 854 ms apart` at
+the start and `Silent move finished at 197` at the end.
+
+- **Interrupting.** Any other move (the cover, a button, an action) stops a
+  silent move at the step it reached and takes over on the same connection.
+- **Sticky blinds.** A silent open from closed does the quick 1-second nudge
+  first, then the slow steps.
+- **Dropped connection.** If the link drops, the package reconnects (up to 3
+  tries) and continues from the motor's reported position.
+- **Sensors.** Scheduled refreshes are skipped while a silent move runs; the
+  sensors are read when it finishes.
+- **Connection slot.** The blind's BLE connection stays open for the whole
+  move (see [BLE connection slots](#ble-connection-slots)).
+
+If the steps turn out noisier than one quick move, change `MIN_STEP_S` (the
+0.5 s minimum between steps) in the package to try fewer, larger steps.
+
+### In automations
+
+The cover's own services (`cover.open_cover`, `cover.close_cover`,
+`cover.set_cover_tilt_position`) are always fast. For silent moves, press the
+buttons or call the actions. ESPHome names the actions
+`esphome.<device name>_<blind_id>_move` and `..._silent_move`, with dashes in
+the device name turned into underscores:
+
+```yaml
+# Silent open to the Open position setting
+- action: button.press
+  target:
+    entity_id: button.master_bedroom_blind_silent_open
+
+# Silent move to a specific angle
+- action: esphome.bedroom_proxy_master_bedroom_silent_move
+  data:
+    position: 115
+
+# Fast move to a specific angle
+- action: esphome.bedroom_proxy_master_bedroom_move
+  data:
+    position: 80
+```
+
+Positions are raw (`0`–`200`, `100` = flat; `3`–`197` on a sticky blind) and
+follow the same rules as the buttons. The package adds these actions to your
+device's `api:` block; they merge with any actions you already have.
 
 ## Sensors
 
@@ -341,7 +415,8 @@ is `esp32_ble: max_connections`, and it defaults to **3**. Two things use
 those connections:
 
 - **each blind**: 1 connection (`ble_client`), held only while the blind
-  moves or refreshes its sensors (a few seconds)
+  moves or refreshes its sensors (a few seconds; a silent move holds it for
+  its whole duration)
 - **an active Bluetooth proxy**: `bluetooth_proxy: connection_slots`
   connections, which also defaults to 3
 
@@ -379,8 +454,9 @@ bluetooth_proxy:
 
 - **Framework.** ESP-IDF is recommended, and an active Bluetooth proxy needs
   it.
-- **Updating from an earlier version.** Nothing changes in your config; the
-  sensor, button and number entities simply appear after the update.
+- **Updating from an earlier version.** Nothing changes in your config; new
+  entities simply appear after the update, and the actions appear under your
+  device in Home Assistant.
 - **Unique `blind_id`.** If two packages use the same `blind_id`, ESPHome
   merges them into one blind instead of reporting an error, so give each blind
   its own.

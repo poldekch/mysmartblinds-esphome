@@ -38,7 +38,9 @@ bluetooth_proxy:
 # closing direction), buttons for the 0 / flat / 200 positions, battery,
 # charging and light sensors, a "Refresh sensors" button and a "Sensor
 # refresh interval" setting (default 10 min) — see the README's Positions
-# and Sensors sections.
+# and Sensors sections. Silent open / Silent close buttons, a "Silent move
+# duration" setting (default 100 s) and <blind_id>_move / _silent_move
+# actions for automations are added too — see "Silent moves".
 packages:
   blind_office:
     url: https://github.com/poldekch/mysmartblinds-esphome

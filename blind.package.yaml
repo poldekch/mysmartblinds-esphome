@@ -71,6 +71,14 @@
 # Moves and sensor reads use the same connection: every move also refreshes the
 # sensors, and between moves the blind is polled on a schedule set by the
 # "Sensor refresh interval" number entity (1-1440 min; default 10 min).
+#
+# Silent moves: the motor has no slow mode of its own, so a silent move holds
+# one connection and steps the position byte from the motor's current
+# position to the target over "Silent move duration" (15-1800 s, default
+# 100 s): at most one write per 0.5 s, at least 1 unit per step. Any other
+# move cancels it. Triggered by the Silent open / Silent close buttons or the
+# <blind_id>_silent_move API action; fast moves by the cover or the
+# <blind_id>_move API action.
 
 # Required by ble_client. Left empty on purpose: scan settings belong to the
 # device config (e.g. a bluetooth_proxy), not to this package.
@@ -103,6 +111,74 @@ globals:
     type: int
     restore_value: false
     initial_value: '-1'
+  # Move bookkeeping. gen counts move commands; a running move compares it
+  # with cur_gen (the command it is executing) to notice it was superseded.
+  - id: ${blind_id}_gen
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_cur_gen
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # True if the pending move is a silent one.
+  - id: ${blind_id}_silent
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Silent move duration in seconds (number entity below), kept across reboots.
+  - id: ${blind_id}_silent_s
+    type: float
+    restore_value: true
+    initial_value: '100'
+  # Silent move plan: start position, number of steps, steps done, ms between
+  # steps; step_pos is the byte written by the current step (or nudge).
+  - id: ${blind_id}_s_start
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_s_steps
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_s_k
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_s_interval
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_step_pos
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Cover operation shown in HA: 0 idle, 1 opening, 2 closing.
+  - id: ${blind_id}_op
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Position reported by the motor on the current connection; -1 = not yet.
+  - id: ${blind_id}_reported
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  # Connection attempts made by the send script for the current job.
+  - id: ${blind_id}_tries
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # millis() by which the current connection should be finished; extended by
+  # each move the session starts (a silent move by its whole duration).
+  - id: ${blind_id}_deadline
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Set by on_disconnect, cleared before each connect attempt.
+  - id: ${blind_id}_ended
+    type: bool
+    restore_value: false
+    initial_value: 'false'
   # Target position byte for the next move (0 .. 200, 100 = flat).
   - id: ${blind_id}_target
     type: uint8_t
@@ -182,16 +258,17 @@ ble_client:
     auto_connect: false          # connect only on demand, freeing the radio
     on_connect:
       then:
-        # 0. Runs synchronously inside service discovery, while the GATT cache
-        #    still exists (ESPHome frees it once every node is established).
-        #    Find the three indicating characteristics by UUID in ANY service,
-        #    register for their indications locally, and remember the CCCD
-        #    handles so they can be written after the key.
+        # Runs synchronously inside service discovery, while the GATT cache
+        # still exists (ESPHome frees it once every node is established).
+        # Find the three indicating characteristics by UUID in ANY service,
+        # register for their indications locally, and remember the CCCD
+        # handles so they can be written after the key.
         - lambda: |-
             id(${blind_id}_authed) = false;
             id(${blind_id}_got) = 0;
             id(${blind_id}_expect) = 0;
             id(${blind_id}_pos_read) = false;
+            id(${blind_id}_reported) = -1;
             uint8_t expect = 0;
             auto *cl = id(${blind_id}_ble);
             // 128-bit UUIDs in the stack's little-endian layout; bytes 12-13
@@ -238,175 +315,303 @@ ble_client:
             id(${blind_id}_handles) = handles;
             id(${blind_id}_cccds) = cccds;
             id(${blind_id}_expect) = expect;
-        - delay: 200ms
-        # 1. Authenticate: write the key to 00001409. The hex digits are paired
-        #    into bytes in order; "0x" prefixes and separators are skipped.
-        - ble_client.ble_write:
-            id: ${blind_id}_ble
-            service_uuid: '00001400-1212-efde-1600-785feabcd123'
-            characteristic_uuid: '00001409-1212-efde-1600-785feabcd123'
-            value: !lambda |-
-              const std::string raw = "${blind_key}";
-              std::string hex;
-              for (size_t i = 0; i < raw.size(); i++) {
-                if (raw[i] == '0' && i + 1 < raw.size() && (raw[i + 1] == 'x' || raw[i + 1] == 'X')) {
-                  i++;
-                  continue;
-                }
-                if (isxdigit((unsigned char) raw[i])) hex += raw[i];
-              }
-              std::vector<uint8_t> out;
-              for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-                out.push_back((uint8_t) strtol(hex.substr(i, 2).c_str(), nullptr, 16));
-              }
-              ESP_LOGD("${blind_id}", "Sending %u-byte key", (unsigned) out.size());
-              return out;
-        - delay: 200ms
-        # 2. Point the decoder sensors at the handles found above, then enable
-        #    indications now that the key is in (one CCCD write per step so
-        #    the stack never has two requests in flight).
-        - lambda: |-
-            id(${blind_id}_authed) = true;
-            auto &h = id(${blind_id}_handles);
-            id(${blind_id}_power_raw)->handle = h[0];
-            id(${blind_id}_status_raw)->handle = h[1];
-            id(${blind_id}_position_raw)->handle = h[2];
-        - repeat:
-            count: 3
-            then:
-              - lambda: |-
-                  auto &c = id(${blind_id}_cccds);
-                  if (iteration >= c.size()) return;
-                  auto *cl = id(${blind_id}_ble);
-                  uint16_t handle = c[iteration] >> 16;
-                  uint8_t value[2] = {(uint8_t) (c[iteration] & 0xFF), 0x00};
-                  esp_err_t err = esp_ble_gattc_write_char_descr(cl->get_gattc_if(), cl->get_conn_id(), handle,
-                                                                 sizeof(value), value, ESP_GATT_WRITE_TYPE_RSP,
-                                                                 ESP_GATT_AUTH_REQ_NONE);
-                  if (err != ESP_OK) ESP_LOGW("${blind_id}", "Enabling indications at 0x%04X failed: %d", handle, err);
-              - delay: 100ms
-        # 3. Move, if a move is pending: write the target byte to 00001403.
-        #    A sticky blind opening from closed is first nudged to full close
-        #    and given 1 s to free itself.
-        - if:
-            condition:
-              lambda: 'return id(${blind_id}_move_pending) && id(${blind_id}_nudge) >= 0;'
-            then:
-              - lambda: |-
-                  ESP_LOGI("${blind_id}", "Sticky blind: nudging to %d before moving to %u", id(${blind_id}_nudge),
-                           (unsigned) id(${blind_id}_target));
-              - ble_client.ble_write:
-                  id: ${blind_id}_ble
-                  service_uuid: '00001400-1212-efde-1600-785feabcd123'
-                  characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
-                  value: !lambda 'return { (uint8_t) id(${blind_id}_nudge) };'
-              - delay: 1s
-        - if:
-            condition:
-              lambda: 'return id(${blind_id}_move_pending);'
-            then:
-              - ble_client.ble_write:
-                  id: ${blind_id}_ble
-                  service_uuid: '00001400-1212-efde-1600-785feabcd123'
-                  characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
-                  value: !lambda 'return { id(${blind_id}_target) };'
-              - lambda: |-
-                  id(${blind_id}_move_pending) = false;
-                  id(${blind_id}_nudge) = -1;
-              - delay: 500ms
-        # 4. Read 00001403 explicitly as well, so the reported position gets a
-        #    value on every connection even if the motor doesn't indicate it.
-        - lambda: |-
-            uint16_t handle = id(${blind_id}_handles)[2];
-            if (handle == 0) return;
-            auto *cl = id(${blind_id}_ble);
-            id(${blind_id}_pos_read) = true;
-            esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
-            if (err != ESP_OK) {
-              id(${blind_id}_pos_read) = false;
-              ESP_LOGW("${blind_id}", "Reading 0x1403 failed: %d", err);
-            }
-        # 5. Wait until every subscribed characteristic has reported (not
-        #    just 00001651), so a refresh-only connection doesn't hang up
-        #    before the position arrives.
-        - wait_until:
-            condition:
-              lambda: 'return (id(${blind_id}_got) & id(${blind_id}_expect)) == id(${blind_id}_expect);'
-            timeout: 3s
-        - lambda: |-
-            uint8_t missing = id(${blind_id}_expect) & ~id(${blind_id}_got);
-            if (missing)
-              ESP_LOGD("${blind_id}", "No data this connection from:%s%s%s", (missing & 1) ? " 0x1651" : "",
-                       (missing & 2) ? " 0x1402" : "", (missing & 4) ? " 0x1403" : "");
-        - lambda: 'id(${blind_id}_done) = true;'
-        - ble_client.disconnect:
-            id: ${blind_id}_ble
+        # The rest runs in a restartable script, so a session left over from a
+        # dropped connection can never act on the next one.
+        - script.execute: ${blind_id}_session
     on_disconnect:
       then:
-        - lambda: 'id(${blind_id}_authed) = false;'
+        - lambda: |-
+            id(${blind_id}_authed) = false;
+            id(${blind_id}_ended) = true;
+        - script.stop: ${blind_id}_session
+        # A silent move cut short stays pending; show the cover as idle until
+        # the next connection resumes it.
+        - if:
+            condition:
+              lambda: 'return id(${blind_id}_op) != 0;'
+            then:
+              - lambda: 'id(${blind_id}_op) = 0;'
+              - script.execute:
+                  id: ${blind_id}_show
+                  pos: !lambda 'return id(${blind_id}_last_pos);'
 
 script:
-  # Connect -> (on_connect writes key, enables indications, writes position if
-  # a move is pending, collects sensor data) -> wait for done -> retry.
-  # mode: restart so a new command supersedes one still in flight.
-  - id: ${blind_id}_send
+  # One connection's work, started by on_connect: key, indications, all
+  # pending moves, sensor data, disconnect.
+  - id: ${blind_id}_session
     mode: restart
+    then:
+      - delay: 200ms
+      # 1. Authenticate: write the key to 00001409. The hex digits are paired
+      #    into bytes in order; "0x" prefixes and separators are skipped.
+      - ble_client.ble_write:
+          id: ${blind_id}_ble
+          service_uuid: '00001400-1212-efde-1600-785feabcd123'
+          characteristic_uuid: '00001409-1212-efde-1600-785feabcd123'
+          value: !lambda |-
+            const std::string raw = "${blind_key}";
+            std::string hex;
+            for (size_t i = 0; i < raw.size(); i++) {
+              if (raw[i] == '0' && i + 1 < raw.size() && (raw[i + 1] == 'x' || raw[i + 1] == 'X')) {
+                i++;
+                continue;
+              }
+              if (isxdigit((unsigned char) raw[i])) hex += raw[i];
+            }
+            std::vector<uint8_t> out;
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+              out.push_back((uint8_t) strtol(hex.substr(i, 2).c_str(), nullptr, 16));
+            }
+            ESP_LOGD("${blind_id}", "Sending %u-byte key", (unsigned) out.size());
+            return out;
+      - delay: 200ms
+      # 2. Point the decoder sensors at the handles found above, then enable
+      #    indications now that the key is in (one CCCD write per step so
+      #    the stack never has two requests in flight).
+      - lambda: |-
+          id(${blind_id}_authed) = true;
+          auto &h = id(${blind_id}_handles);
+          id(${blind_id}_power_raw)->handle = h[0];
+          id(${blind_id}_status_raw)->handle = h[1];
+          id(${blind_id}_position_raw)->handle = h[2];
+      - repeat:
+          count: 3
+          then:
+            - lambda: |-
+                auto &c = id(${blind_id}_cccds);
+                if (iteration >= c.size()) return;
+                auto *cl = id(${blind_id}_ble);
+                uint16_t handle = c[iteration] >> 16;
+                uint8_t value[2] = {(uint8_t) (c[iteration] & 0xFF), 0x00};
+                esp_err_t err = esp_ble_gattc_write_char_descr(cl->get_gattc_if(), cl->get_conn_id(), handle,
+                                                               sizeof(value), value, ESP_GATT_WRITE_TYPE_RSP,
+                                                               ESP_GATT_AUTH_REQ_NONE);
+                if (err != ESP_OK) ESP_LOGW("${blind_id}", "Enabling indications at 0x%04X failed: %d", handle, err);
+            - delay: 100ms
+      # 3. Moves. Loops, so a command that arrives while connected (e.g. one
+      #    interrupting a silent move) is handled on this same connection.
+      - while:
+          condition:
+            lambda: 'return id(${blind_id}_move_pending) && id(${blind_id}_authed);'
+          then:
+            - lambda: |-
+                id(${blind_id}_cur_gen) = id(${blind_id}_gen);
+                id(${blind_id}_deadline) = millis() + 15000;
+            # 3a. Sticky blind opening from closed: nudge to full close and
+            #     give it 1 s to free itself.
+            - if:
+                condition:
+                  lambda: 'return id(${blind_id}_nudge) >= 0;'
+                then:
+                  - lambda: |-
+                      ESP_LOGI("${blind_id}", "Sticky blind: nudging to %d before moving to %u", id(${blind_id}_nudge),
+                               (unsigned) id(${blind_id}_target));
+                      id(${blind_id}_step_pos) = id(${blind_id}_nudge);
+                      id(${blind_id}_nudge) = -1;
+                  - ble_client.ble_write:
+                      id: ${blind_id}_ble
+                      service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                      characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+                      value: !lambda 'return { (uint8_t) id(${blind_id}_step_pos) };'
+                  - lambda: 'id(${blind_id}_reported) = id(${blind_id}_step_pos);'
+                  - delay: 1s
+            - if:
+                condition:
+                  lambda: 'return !id(${blind_id}_silent);'
+                # 3b. Fast move: write the target byte to 00001403.
+                then:
+                  - ble_client.ble_write:
+                      id: ${blind_id}_ble
+                      service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                      characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+                      value: !lambda 'return { id(${blind_id}_target) };'
+                  - lambda: |-
+                      if (id(${blind_id}_gen) == id(${blind_id}_cur_gen)) id(${blind_id}_move_pending) = false;
+                  - delay: 500ms
+                # 3c. Silent move: step from the motor's current position to
+                #     the target over the configured duration.
+                else:
+                  # Make sure the current position is known (the motor usually
+                  # indicates it as soon as indications are enabled).
+                  - if:
+                      condition:
+                        lambda: 'return id(${blind_id}_reported) < 0 && id(${blind_id}_handles)[2] != 0;'
+                      then:
+                        - lambda: |-
+                            auto *cl = id(${blind_id}_ble);
+                            id(${blind_id}_pos_read) = true;
+                            esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), id(${blind_id}_handles)[2],
+                                                    ESP_GATT_AUTH_REQ_NONE);
+                        - wait_until:
+                            condition:
+                              lambda: 'return id(${blind_id}_reported) >= 0;'
+                            timeout: 2s
+                  - lambda: |-
+                      // Shortest pause between two steps. Lower = smaller,
+                      // more frequent steps; raise it if the steps get noisy.
+                      const float MIN_STEP_S = 0.5f;
+                      int target = id(${blind_id}_target);
+                      int start = id(${blind_id}_reported);
+                      if (start < 0) start = id(${blind_id}_last_pos);
+                      if (start < 0) {
+                        ESP_LOGW("${blind_id}", "Silent move: current position unknown, moving directly");
+                        start = target;  // no steps; the target is written below
+                      }
+                      int dist = abs(target - start);
+                      float dur = id(${blind_id}_silent_s);
+                      int steps = std::min(dist, std::max(1, (int) (dur / MIN_STEP_S)));
+                      id(${blind_id}_s_start) = start;
+                      id(${blind_id}_s_steps) = steps;
+                      id(${blind_id}_s_k) = 0;
+                      id(${blind_id}_s_interval) = steps > 0 ? (uint32_t) (dur * 1000.0f / steps) : 0;
+                      id(${blind_id}_step_pos) = target;
+                      id(${blind_id}_op) = abs(target - 100) < abs(start - 100) ? 1 : 2;  // opening : closing
+                      id(${blind_id}_deadline) = millis() + (uint32_t) (dur * 1000.0f) + 15000;
+                      ESP_LOGI("${blind_id}", "Silent move %d -> %d: %d steps, %u ms apart", start, target, steps,
+                               (unsigned) id(${blind_id}_s_interval));
+                  - while:
+                      condition:
+                        lambda: |-
+                          return id(${blind_id}_authed) && id(${blind_id}_gen) == id(${blind_id}_cur_gen) &&
+                                 id(${blind_id}_s_k) < id(${blind_id}_s_steps);
+                      then:
+                        - lambda: |-
+                            int k = ++id(${blind_id}_s_k);
+                            int start = id(${blind_id}_s_start);
+                            int target = id(${blind_id}_target);
+                            id(${blind_id}_step_pos) =
+                                start + (int) lroundf((float) k * (target - start) / id(${blind_id}_s_steps));
+                            id(${blind_id}_reported) = id(${blind_id}_step_pos);  // where a re-plan starts
+                            id(${blind_id}_show)->execute(id(${blind_id}_step_pos));
+                        - ble_client.ble_write:
+                            id: ${blind_id}_ble
+                            service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                            characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+                            value: !lambda 'return { (uint8_t) id(${blind_id}_step_pos) };'
+                        # Pause until the next step, ending early if another
+                        # command arrives or the connection drops.
+                        - wait_until:
+                            condition:
+                              lambda: 'return id(${blind_id}_gen) != id(${blind_id}_cur_gen) || !id(${blind_id}_authed);'
+                            timeout: !lambda 'return id(${blind_id}_s_interval);'
+                  # Zero steps (already there, or position unknown): write the
+                  # target once so the motor ends up exactly on it.
+                  - if:
+                      condition:
+                        lambda: 'return id(${blind_id}_s_steps) == 0 && id(${blind_id}_gen) == id(${blind_id}_cur_gen);'
+                      then:
+                        - ble_client.ble_write:
+                            id: ${blind_id}_ble
+                            service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                            characteristic_uuid: '00001403-1212-efde-1600-785feabcd123'
+                            value: !lambda 'return { id(${blind_id}_target) };'
+                  - lambda: |-
+                      bool same = id(${blind_id}_gen) == id(${blind_id}_cur_gen);
+                      bool finished = same && id(${blind_id}_s_k) >= id(${blind_id}_s_steps);
+                      if (finished) {
+                        id(${blind_id}_move_pending) = false;
+                        ESP_LOGI("${blind_id}", "Silent move finished at %u", (unsigned) id(${blind_id}_target));
+                      } else if (!same) {
+                        ESP_LOGI("${blind_id}", "Silent move interrupted by a new command");
+                      }
+                      id(${blind_id}_op) = 0;
+                      if (finished) id(${blind_id}_show)->execute((int) id(${blind_id}_target));
+      # 4. Read 00001403 explicitly as well, so the reported position gets a
+      #    value on every connection even if the motor doesn't indicate it.
+      - lambda: |-
+          uint16_t handle = id(${blind_id}_handles)[2];
+          if (handle == 0) return;
+          auto *cl = id(${blind_id}_ble);
+          id(${blind_id}_pos_read) = true;
+          esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
+          if (err != ESP_OK) {
+            id(${blind_id}_pos_read) = false;
+            ESP_LOGW("${blind_id}", "Reading 0x1403 failed: %d", err);
+          }
+      # 5. Wait until every subscribed characteristic has reported (not
+      #    just 00001651), so a refresh-only connection doesn't hang up
+      #    before the position arrives.
+      - wait_until:
+          condition:
+            lambda: 'return (id(${blind_id}_got) & id(${blind_id}_expect)) == id(${blind_id}_expect);'
+          timeout: 3s
+      - lambda: |-
+          uint8_t missing = id(${blind_id}_expect) & ~id(${blind_id}_got);
+          if (missing)
+            ESP_LOGD("${blind_id}", "No data this connection from:%s%s%s", (missing & 1) ? " 0x1651" : "",
+                     (missing & 2) ? " 0x1402" : "", (missing & 4) ? " 0x1403" : "");
+          // A move that arrived after step 3 is still pending: not done, so
+          // the send script reconnects for it.
+          id(${blind_id}_done) = !id(${blind_id}_move_pending);
+      - ble_client.disconnect:
+          id: ${blind_id}_ble
+
+  # Connect -> (session: key, indications, moves, sensor data) -> repeat until
+  # done, up to 3 tries. A move that arrives while this runs is picked up by
+  # the running session or the next try (and resets the try count).
+  - id: ${blind_id}_send
+    mode: single
     then:
       # Restart the refresh timer on every attempt (successful or not), so an
       # unreachable blind is retried at the refresh interval, not every minute.
       - lambda: |-
           id(${blind_id}_done) = false;
+          id(${blind_id}_tries) = 0;
           id(${blind_id}_last_refresh) = std::max<uint32_t>(1, millis());
-      - repeat:
-          count: 3
+      - while:
+          condition:
+            lambda: 'return !id(${blind_id}_done) && id(${blind_id}_tries) < 3;'
           then:
+            # Dial the advertised address: the dump's MAC with its byte
+            # order reversed. The motor uses a RANDOM address type;
+            # without it the client dials a public address and never
+            # connects. Both are set right before each connect (instead
+            # of in esphome.on_boot) so the package doesn't touch the
+            # device's esphome: block, and a disconnect that clears the
+            # address can't break the next attempt.
+            - lambda: |-
+                id(${blind_id}_tries)++;
+                id(${blind_id}_ended) = false;
+                id(${blind_id}_deadline) = millis() + 15000;
+                const std::string mac = "${blind_mac}";
+                uint64_t addr = 0;
+                int nibbles = 0;
+                uint8_t byte = 0;
+                for (char c : mac) {
+                  if (!isxdigit((unsigned char) c)) continue;
+                  byte = (byte << 4) | (uint8_t) strtol(std::string(1, c).c_str(), nullptr, 16);
+                  if (++nibbles % 2 == 0) {
+                    // Byte n of the dump becomes byte n from the END of
+                    // the advertised address.
+                    addr |= (uint64_t) byte << (8 * (nibbles / 2 - 1));
+                    byte = 0;
+                  }
+                }
+                if (nibbles != 12) {
+                  ESP_LOGE("${blind_id}", "blind_mac '%s' is not a 6-byte MAC", mac.c_str());
+                  return;
+                }
+                id(${blind_id}_ble).set_address(addr);
+                id(${blind_id}_ble).set_remote_addr_type(BLE_ADDR_TYPE_RANDOM);
+                ESP_LOGI("${blind_id}", "Connecting to %02X:%02X:%02X:%02X:%02X:%02X (dump MAC %s reversed)",
+                         (unsigned) (addr >> 40) & 0xFF, (unsigned) (addr >> 32) & 0xFF,
+                         (unsigned) (addr >> 24) & 0xFF, (unsigned) (addr >> 16) & 0xFF,
+                         (unsigned) (addr >> 8) & 0xFF, (unsigned) addr & 0xFF, mac.c_str());
+                id(${blind_id}_ble).connect();
+            # Wait for the session to finish, the link to drop, or the
+            # deadline (15 s, extended by each move; a silent move keeps the
+            # connection for its whole duration).
+            - wait_until:
+                condition:
+                  lambda: |-
+                    return id(${blind_id}_done) || id(${blind_id}_ended) ||
+                           (int32_t) (millis() - id(${blind_id}_deadline)) > 0;
             - if:
                 condition:
                   lambda: 'return !id(${blind_id}_done);'
                 then:
-                  # Dial the advertised address: the dump's MAC with its byte
-                  # order reversed. The motor uses a RANDOM address type;
-                  # without it the client dials a public address and never
-                  # connects. Both are set right before each connect (instead
-                  # of in esphome.on_boot) so the package doesn't touch the
-                  # device's esphome: block, and a disconnect that clears the
-                  # address can't break the next attempt.
-                  - lambda: |-
-                      const std::string mac = "${blind_mac}";
-                      uint64_t addr = 0;
-                      int nibbles = 0;
-                      uint8_t byte = 0;
-                      for (char c : mac) {
-                        if (!isxdigit((unsigned char) c)) continue;
-                        byte = (byte << 4) | (uint8_t) strtol(std::string(1, c).c_str(), nullptr, 16);
-                        if (++nibbles % 2 == 0) {
-                          // Byte n of the dump becomes byte n from the END of
-                          // the advertised address.
-                          addr |= (uint64_t) byte << (8 * (nibbles / 2 - 1));
-                          byte = 0;
-                        }
-                      }
-                      if (nibbles != 12) {
-                        ESP_LOGE("${blind_id}", "blind_mac '%s' is not a 6-byte MAC", mac.c_str());
-                        return;
-                      }
-                      id(${blind_id}_ble).set_address(addr);
-                      id(${blind_id}_ble).set_remote_addr_type(BLE_ADDR_TYPE_RANDOM);
-                      ESP_LOGI("${blind_id}", "Connecting to %02X:%02X:%02X:%02X:%02X:%02X (dump MAC %s reversed)",
-                               (unsigned) (addr >> 40) & 0xFF, (unsigned) (addr >> 32) & 0xFF,
-                               (unsigned) (addr >> 24) & 0xFF, (unsigned) (addr >> 16) & 0xFF,
-                               (unsigned) (addr >> 8) & 0xFF, (unsigned) addr & 0xFF, mac.c_str());
-                      id(${blind_id}_ble).connect();
-                  - wait_until:
-                      condition:
-                        lambda: 'return id(${blind_id}_done);'
-                      timeout: 15s
-                  - if:
-                      condition:
-                        lambda: 'return !id(${blind_id}_done);'
-                      then:
-                        - lambda: 'id(${blind_id}_ble).disconnect();'
-                        - delay: 1s
+                  - lambda: 'id(${blind_id}_ble).disconnect();'
+                  - delay: 1s
       - if:
           condition:
             lambda: 'return !id(${blind_id}_done);'
@@ -415,13 +620,29 @@ script:
                 format: "%s: %s failed after 3 tries"
                 args: ['"${blind_name}"', 'id(${blind_id}_move_pending) ? "move" : "sensor refresh"']
 
-  # Move to a raw position byte (0..200, limited to [margin, 200 - margin]).
-  # Shows it in the cover right away; the motor's own report replaces it after
-  # the next connection.
+  # Starts the send script once it is free, if a move is still pending. Covers
+  # a move that arrives just as a running send script finishes.
+  - id: ${blind_id}_kick
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return !id(${blind_id}_send).is_running();'
+      - if:
+          condition:
+            lambda: 'return id(${blind_id}_move_pending);'
+          then:
+            - script.execute: ${blind_id}_send
+
+  # Move to a raw position byte (0..200, limited to [margin, 200 - margin]),
+  # fast or silent. A fast move shows the target in the cover right away; a
+  # silent one shows each step as it goes. Any new move replaces one in
+  # progress, including a silent one.
   - id: ${blind_id}_move
     mode: queued
     parameters:
       pos: int
+      silent: bool
     then:
       - lambda: |-
           const int m = id(${blind_id}_margin);
@@ -434,27 +655,36 @@ script:
           if (m > 0 && last >= 0 && (last <= 5 || last >= 195) && abs(p - 100) < abs(last - 100)) {
             id(${blind_id}_nudge) = id(${blind_id}_close_pos) >= 100 ? 200 : 0;
           }
+          id(${blind_id}_gen)++;
           id(${blind_id}_target) = (uint8_t) p;
+          id(${blind_id}_silent) = silent;
           id(${blind_id}_move_pending) = true;
-          id(${blind_id}_show)->execute(p);
-      - script.execute: ${blind_id}_send
+          if (!silent) id(${blind_id}_show)->execute(p);
+          if (id(${blind_id}_send)->is_running()) {
+            id(${blind_id}_tries) = 0;          // fresh tries for the new move
+            id(${blind_id}_kick)->execute();
+          } else {
+            id(${blind_id}_send)->execute();
+          }
 
   # Publish a raw position (0..200) as the cover's state. Tilt is how open the
   # slats are: 1.0 at 100 (flat), 0.0 at either closed end (0 or 200). Within
-  # 5 steps of an end the cover counts as closed.
+  # 5 steps of an end the cover counts as closed. The operation (idle /
+  # opening / closing) comes from ${blind_id}_op.
   - id: ${blind_id}_show
     mode: queued
     parameters:
       pos: int
     then:
       - lambda: |-
+          if (pos < 0) return;
           id(${blind_id}_last_pos) = pos;
           float tilt = 1.0f - fabsf((float) pos - 100.0f) / 100.0f;
           tilt = std::max(0.0f, std::min(1.0f, tilt));
           auto *c = id(${blind_id}_cover);
           c->tilt = tilt;
           c->position = tilt <= 0.05f ? COVER_CLOSED : COVER_OPEN;
-          c->current_operation = COVER_OPERATION_IDLE;
+          c->current_operation = (cover::CoverOperation) id(${blind_id}_op);
           c->publish_state();
 
   # Sensor refresh without moving. Never interrupts a move in progress (that
@@ -484,10 +714,12 @@ cover:
       - script.execute:
           id: ${blind_id}_move
           pos: !lambda 'return id(${blind_id}_open_pos);'
+          silent: false
     close_action:
       - script.execute:
           id: ${blind_id}_move
           pos: !lambda 'return id(${blind_id}_close_pos);'
+          silent: false
     # tilt is 0.0 (closed) .. 1.0 (flat); it closes toward the side of the
     # close position (200 side if it is >= 100, else 0 side).
     tilt_action:
@@ -496,6 +728,7 @@ cover:
           pos: !lambda |-
             int dir = id(${blind_id}_close_pos) >= 100 ? 1 : -1;
             return 100 + dir * (int) lroundf((1.0f - tilt) * 100.0f);
+          silent: false
 
 sensor:
   # --- Decoders (internal). They only receive indications; on_connect points
@@ -571,6 +804,7 @@ sensor:
       id(${blind_id}_pos_read) = false;
       ESP_LOGD("${blind_id}", "0x1403 (%s): %s = %u", src, format_hex_pretty(x).c_str(), (unsigned) x[0]);
       id(${blind_id}_reported_position).publish_state(x[0]);
+      id(${blind_id}_reported) = x[0];
       // Drive the cover from it, except while a move is still to be written:
       // the value indicated then is the position BEFORE the move.
       if (!id(${blind_id}_move_pending)) id(${blind_id}_show)->execute(x[0]);
@@ -710,6 +944,7 @@ button:
       - script.execute:
           id: ${blind_id}_move
           pos: 0
+          silent: false
   - platform: template
     id: ${blind_id}_flat_button
     name: "${blind_name} Open flat"
@@ -718,6 +953,7 @@ button:
       - script.execute:
           id: ${blind_id}_move
           pos: 100
+          silent: false
   - platform: template
     id: ${blind_id}_close_high_button
     name: "${blind_name} Close (200 side)"
@@ -726,6 +962,27 @@ button:
       - script.execute:
           id: ${blind_id}_move
           pos: 200
+          silent: false
+  # Silent moves to the Open / Close position settings, over the Silent move
+  # duration. Meant for automations (e.g. waking up, someone asleep).
+  - platform: template
+    id: ${blind_id}_silent_open_button
+    name: "${blind_name} Silent open"
+    icon: mdi:blinds-open
+    on_press:
+      - script.execute:
+          id: ${blind_id}_move
+          pos: !lambda 'return id(${blind_id}_open_pos);'
+          silent: true
+  - platform: template
+    id: ${blind_id}_silent_close_button
+    name: "${blind_name} Silent close"
+    icon: mdi:blinds
+    on_press:
+      - script.execute:
+          id: ${blind_id}_move
+          pos: !lambda 'return id(${blind_id}_close_pos);'
+          silent: true
 
 number:
   # How often to connect just to read the sensors. Every connection costs the
@@ -788,6 +1045,45 @@ number:
     set_action:
       - lambda: 'id(${blind_id}_close_pos) = (int) x;'
       - component.update: ${blind_id}_close_position
+
+  # How long a silent move takes, whatever its distance.
+  - platform: template
+    id: ${blind_id}_silent_duration
+    name: "${blind_name} Silent move duration"
+    icon: mdi:timer-sand
+    entity_category: config
+    unit_of_measurement: s
+    min_value: 15
+    max_value: 1800
+    step: 1
+    mode: box
+    update_interval: 60s
+    lambda: 'return id(${blind_id}_silent_s);'
+    set_action:
+      - lambda: 'id(${blind_id}_silent_s) = x;'
+      - component.update: ${blind_id}_silent_duration
+
+# Home Assistant actions for automations, merged into the device's api:
+# block: esphome.<device>_<blind_id>_move / _silent_move, each taking a raw
+# position 0-200 (100 = flat; limited to 3-197 on a sticky blind).
+api:
+  actions:
+    - action: ${blind_id}_move
+      variables:
+        position: int
+      then:
+        - script.execute:
+            id: ${blind_id}_move
+            pos: !lambda 'return position;'
+            silent: false
+    - action: ${blind_id}_silent_move
+      variables:
+        position: int
+      then:
+        - script.execute:
+            id: ${blind_id}_move
+            pos: !lambda 'return position;'
+            silent: true
 
 interval:
   # Checks every 10 s whether a refresh is due (fine enough for a 1-minute
