@@ -42,17 +42,21 @@
 #
 # Protocol. All characteristics share the base xxxxxxxx-1212-efde-1600-785feabcd123.
 #   00001409  write the key first; nothing else works until it is written.
-#   00001403  write one position byte: 100 = flat/open, 200 = closed; tilt maps
-#             as 200 - tilt*100. The motor also indicates a byte here (one
-#             motor reported 0x63 = 99); whether it tracks wand/schedule moves
-#             is untested, so the cover stays optimistic / assumed_state and
-#             the value is only shown as a sensor, not used by the cover.
+#   00001403  write one position byte: 100 = flat/open, 200 = closed one way,
+#             and (per the older pysmartblinds notes, not yet verified here)
+#             0 = closed the other way. Reading/indicating it returns the
+#             motor's position on the same scale; it follows wand moves
+#             (verified: 131 after a wand move, 199 after closing to 200).
+#             Right after a move it returns the target until the motor
+#             finishes. The cover's state follows this value.
 #   00001402  status indication; bytes 0-3 are a little-endian bitfield:
 #             0x00040000 = solar charging, 0x00080000 = USB charging.
 #   00001651  power/sensor indication, 14 bytes: [0] battery %, [1] reserved,
 #             then six little-endian uint16: battery voltage, battery charge,
 #             solar-panel voltage, interior temperature, battery temperature,
-#             raw light. Only battery % is in known units; the rest are raw.
+#             raw light. Battery % is known; voltages look like mV and
+#             temperatures like 0.1 degC (plausible values, not verified);
+#             battery charge and light stay raw.
 # Indications are enabled (CCCD written) only AFTER the key, as the official
 # app does; the motor does not send 00001651 data otherwise. 00001651 is looked
 # up by its UUID across all services, so the guessed service UUID on its sensor
@@ -66,7 +70,7 @@
 esp32_ble_tracker: {}
 
 globals:
-  # Target position byte for the next move (100 open .. 200 closed).
+  # Target position byte for the next move (0 .. 200, 100 = flat).
   - id: ${blind_id}_target
     type: uint8_t
     restore_value: false
@@ -104,6 +108,17 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  # Positions used by the cover's open / close actions ("smart" open/close),
+  # set via the number entities below and kept across reboots. The close
+  # position also decides which way the tilt slider closes (above or below 100).
+  - id: ${blind_id}_open_pos
+    type: int
+    restore_value: true
+    initial_value: '100'
+  - id: ${blind_id}_close_pos
+    type: int
+    restore_value: true
+    initial_value: '200'
   # Sensor refresh interval in minutes, set via the number entity below and
   # kept across reboots.
   - id: ${blind_id}_refresh_min
@@ -167,6 +182,30 @@ ble_client:
                 continue;
               }
               handles[i] = chr.char_handle;
+              // Log (once per boot) which service each characteristic is in,
+              // to pin down the service UUID for the decoder sensors.
+              static bool svc_logged[3] = {false, false, false};
+              if (!svc_logged[i]) {
+                esp_gattc_service_elem_t svc;
+                for (uint16_t off = 0;; off++) {
+                  uint16_t n = 1;
+                  if (esp_ble_gattc_get_service(cl->get_gattc_if(), cl->get_conn_id(), nullptr, &svc, &n, off) !=
+                          ESP_GATT_OK || n == 0)
+                    break;
+                  if (chr.char_handle < svc.start_handle || chr.char_handle > svc.end_handle) continue;
+                  svc_logged[i] = true;
+                  if (svc.uuid.len == ESP_UUID_LEN_16) {
+                    ESP_LOGI("${blind_id}", "0x%04X is in service 0x%04X", shorts[i], svc.uuid.uuid.uuid16);
+                  } else if (svc.uuid.len == ESP_UUID_LEN_128) {
+                    const uint8_t *u = svc.uuid.uuid.uuid128;
+                    ESP_LOGI("${blind_id}",
+                             "0x%04X is in service %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                             shorts[i], u[15], u[14], u[13], u[12], u[11], u[10], u[9], u[8], u[7], u[6], u[5], u[4],
+                             u[3], u[2], u[1], u[0]);
+                  }
+                  break;
+                }
+              }
               esp_bt_uuid_t cccd_uuid = {};
               cccd_uuid.len = ESP_UUID_LEN_16;
               cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
@@ -350,6 +389,37 @@ script:
                 format: "%s: %s failed after 3 tries"
                 args: ['"${blind_name}"', 'id(${blind_id}_move_pending) ? "move" : "sensor refresh"']
 
+  # Move to a raw position byte (0..200). Shows it in the cover right away;
+  # the motor's own report replaces it after the next connection.
+  - id: ${blind_id}_move
+    mode: queued
+    parameters:
+      pos: int
+    then:
+      - lambda: |-
+          int p = std::max(0, std::min(200, pos));
+          id(${blind_id}_target) = (uint8_t) p;
+          id(${blind_id}_move_pending) = true;
+          id(${blind_id}_show)->execute(p);
+      - script.execute: ${blind_id}_send
+
+  # Publish a raw position (0..200) as the cover's state. Tilt is how open the
+  # slats are: 1.0 at 100 (flat), 0.0 at either closed end (0 or 200). Within
+  # 5 steps of an end the cover counts as closed.
+  - id: ${blind_id}_show
+    mode: queued
+    parameters:
+      pos: int
+    then:
+      - lambda: |-
+          float tilt = 1.0f - fabsf((float) pos - 100.0f) / 100.0f;
+          tilt = std::max(0.0f, std::min(1.0f, tilt));
+          auto *c = id(${blind_id}_cover);
+          c->tilt = tilt;
+          c->position = tilt <= 0.05f ? COVER_CLOSED : COVER_OPEN;
+          c->current_operation = COVER_OPERATION_IDLE;
+          c->publish_state();
+
   # Sensor refresh without moving. Never interrupts a move in progress (that
   # move refreshes the sensors anyway).
   - id: ${blind_id}_refresh
@@ -366,25 +436,29 @@ cover:
     id: ${blind_id}_cover
     name: "${blind_name}"
     device_class: blind
-    assumed_state: true      # no verified position feedback; see 00001403 above
-    optimistic: true
+    # State comes from the motor's reported position (see the _show script),
+    # refreshed on every connection. assumed_state keeps both open and close
+    # usable in HA, since the motor can be moved by the wand in between.
+    assumed_state: true
+    optimistic: false
     has_position: false
+    # Open / close go to the configurable "smart" positions.
     open_action:
-      - lambda: |-
-          id(${blind_id}_target) = 100;
-          id(${blind_id}_move_pending) = true;
-      - script.execute: ${blind_id}_send
+      - script.execute:
+          id: ${blind_id}_move
+          pos: !lambda 'return id(${blind_id}_open_pos);'
     close_action:
-      - lambda: |-
-          id(${blind_id}_target) = 200;
-          id(${blind_id}_move_pending) = true;
-      - script.execute: ${blind_id}_send
+      - script.execute:
+          id: ${blind_id}_move
+          pos: !lambda 'return id(${blind_id}_close_pos);'
+    # tilt is 0.0 (closed) .. 1.0 (flat); it closes toward the side of the
+    # close position (200 side if it is >= 100, else 0 side).
     tilt_action:
-      # tilt is 0.0 (closed) .. 1.0 (open); byte is 200 (closed) .. 100 (flat).
-      - lambda: |-
-          id(${blind_id}_target) = (uint8_t) (200 - (int) (tilt * 100));
-          id(${blind_id}_move_pending) = true;
-      - script.execute: ${blind_id}_send
+      - script.execute:
+          id: ${blind_id}_move
+          pos: !lambda |-
+            int dir = id(${blind_id}_close_pos) >= 100 ? 1 : -1;
+            return 100 + dir * (int) lroundf((1.0f - tilt) * 100.0f);
 
 sensor:
   # --- Decoders (internal). They only receive indications; on_connect points
@@ -409,15 +483,16 @@ sensor:
         ESP_LOGW("${blind_id}", "0x1651: expected 14 bytes, got %u", (unsigned) x.size());
         return NAN;
       }
-      auto u16 = [&x](size_t i) -> float { return (float) (x[i] | (x[i + 1] << 8)); };
+      auto u16 = [&x](size_t i) -> float { return (float) (uint16_t) (x[i] | (x[i + 1] << 8)); };
+      auto s16 = [&x](size_t i) -> float { return (float) (int16_t) (x[i] | (x[i + 1] << 8)); };
       ESP_LOGD("${blind_id}", "0x1651: %s", format_hex_pretty(x).c_str());
       id(${blind_id}_battery).publish_state(x[0]);
-      id(${blind_id}_battery_voltage).publish_state(u16(2));
-      id(${blind_id}_battery_charge).publish_state(u16(4));
-      id(${blind_id}_solar_voltage).publish_state(u16(6));
-      id(${blind_id}_interior_temp).publish_state(u16(8));
-      id(${blind_id}_battery_temp).publish_state(u16(10));
-      id(${blind_id}_light).publish_state(u16(12));
+      id(${blind_id}_battery_voltage).publish_state(u16(2) / 1000.0f);   // mV -> V (assumed)
+      id(${blind_id}_battery_charge).publish_state(u16(4));               // raw
+      id(${blind_id}_solar_voltage).publish_state(u16(6) / 1000.0f);     // mV -> V (assumed)
+      id(${blind_id}_interior_temp).publish_state(s16(8) / 10.0f);       // 0.1 degC (assumed)
+      id(${blind_id}_battery_temp).publish_state(s16(10) / 10.0f);       // 0.1 degC (assumed)
+      id(${blind_id}_light).publish_state(u16(12));                       // raw
       id(${blind_id}_got) |= 1;
       return x[0];
 
@@ -462,13 +537,16 @@ sensor:
       id(${blind_id}_pos_read) = false;
       ESP_LOGD("${blind_id}", "0x1403 (%s): %s = %u", src, format_hex_pretty(x).c_str(), (unsigned) x[0]);
       id(${blind_id}_reported_position).publish_state(x[0]);
+      // Drive the cover from it, except while a move is still to be written:
+      // the value indicated then is the position BEFORE the move.
+      if (!id(${blind_id}_move_pending)) id(${blind_id}_show)->execute(x[0]);
       id(${blind_id}_got) |= 4;
       return NAN;
 
   # --- Entities shown in Home Assistant. They keep their last value between
-  # connections. Only battery % has verified units; the others are the raw
-  # 16-bit values the motor sends. To calibrate one, redeclare it by id in your
-  # device config and add filters (ESPHome merges list items with the same id).
+  # connections. Only battery % has verified units; volts and degC are inferred
+  # from plausible readings. To correct one, redeclare it by id in your device
+  # config and add filters (ESPHome merges list items with the same id).
   - platform: template
     id: ${blind_id}_battery
     name: "${blind_name} Battery"
@@ -486,12 +564,13 @@ sensor:
     update_interval: never
   - platform: template
     id: ${blind_id}_battery_voltage
-    name: "${blind_name} Battery voltage (raw)"
-    icon: mdi:flash-triangle
+    name: "${blind_name} Battery voltage"
+    device_class: voltage
+    unit_of_measurement: V
     entity_category: diagnostic
     disabled_by_default: true
     state_class: measurement
-    accuracy_decimals: 0
+    accuracy_decimals: 3
     update_interval: never
   - platform: template
     id: ${blind_id}_battery_charge
@@ -504,34 +583,37 @@ sensor:
     update_interval: never
   - platform: template
     id: ${blind_id}_solar_voltage
-    name: "${blind_name} Solar panel voltage (raw)"
+    name: "${blind_name} Solar panel voltage"
+    device_class: voltage
+    unit_of_measurement: V
     icon: mdi:solar-panel
     entity_category: diagnostic
     disabled_by_default: true
     state_class: measurement
-    accuracy_decimals: 0
+    accuracy_decimals: 3
     update_interval: never
   - platform: template
     id: ${blind_id}_interior_temp
-    name: "${blind_name} Interior temperature (raw)"
-    icon: mdi:thermometer
+    name: "${blind_name} Interior temperature"
+    device_class: temperature
+    unit_of_measurement: "°C"
     entity_category: diagnostic
     disabled_by_default: true
     state_class: measurement
-    accuracy_decimals: 0
+    accuracy_decimals: 1
     update_interval: never
   - platform: template
     id: ${blind_id}_battery_temp
-    name: "${blind_name} Battery temperature (raw)"
-    icon: mdi:thermometer
+    name: "${blind_name} Battery temperature"
+    device_class: temperature
+    unit_of_measurement: "°C"
     entity_category: diagnostic
     disabled_by_default: true
     state_class: measurement
-    accuracy_decimals: 0
+    accuracy_decimals: 1
     update_interval: never
-  # Byte the motor indicates on 00001403 (0-200 scale). Shown for information
-  # only: it is not yet known whether it follows wand or schedule moves, so the
-  # cover does not use it.
+  # Position the motor reports on 00001403 (0-200, 100 = flat). Also drives
+  # the cover's state.
   - platform: template
     id: ${blind_id}_reported_position
     name: "${blind_name} Reported position (raw)"
@@ -572,6 +654,33 @@ button:
     entity_category: diagnostic
     on_press:
       - script.execute: ${blind_id}_refresh
+  # Direct moves to the three fixed positions, regardless of the open/close
+  # settings. Which physical direction "0 side" and "200 side" are (slats'
+  # top toward the room or the window) depends on how the blind is mounted.
+  - platform: template
+    id: ${blind_id}_close_low_button
+    name: "${blind_name} Close (0 side)"
+    icon: mdi:blinds
+    on_press:
+      - script.execute:
+          id: ${blind_id}_move
+          pos: 0
+  - platform: template
+    id: ${blind_id}_flat_button
+    name: "${blind_name} Open flat"
+    icon: mdi:blinds-open
+    on_press:
+      - script.execute:
+          id: ${blind_id}_move
+          pos: 100
+  - platform: template
+    id: ${blind_id}_close_high_button
+    name: "${blind_name} Close (200 side)"
+    icon: mdi:blinds
+    on_press:
+      - script.execute:
+          id: ${blind_id}_move
+          pos: 200
 
 number:
   # How often to connect just to read the sensors. Every connection costs the
@@ -596,6 +705,38 @@ number:
     set_action:
       - lambda: 'id(${blind_id}_refresh_min) = x;'
       - component.update: ${blind_id}_refresh_minutes
+
+  # "Smart" open and close: the raw positions (0-200, 100 = flat) the cover's
+  # open and close actions go to. E.g. open 120 or 80 to angle the slats for
+  # more light, close 0 instead of 200 to close the other way.
+  - platform: template
+    id: ${blind_id}_open_position
+    name: "${blind_name} Open position"
+    icon: mdi:blinds-open
+    entity_category: config
+    min_value: 0
+    max_value: 200
+    step: 1
+    mode: box
+    update_interval: 60s
+    lambda: 'return id(${blind_id}_open_pos);'
+    set_action:
+      - lambda: 'id(${blind_id}_open_pos) = (int) x;'
+      - component.update: ${blind_id}_open_position
+  - platform: template
+    id: ${blind_id}_close_position
+    name: "${blind_name} Close position"
+    icon: mdi:blinds
+    entity_category: config
+    min_value: 0
+    max_value: 200
+    step: 1
+    mode: box
+    update_interval: 60s
+    lambda: 'return id(${blind_id}_close_pos);'
+    set_action:
+      - lambda: 'id(${blind_id}_close_pos) = (int) x;'
+      - component.update: ${blind_id}_close_position
 
 interval:
   # Checks every 10 s whether a refresh is due (fine enough for a 1-minute

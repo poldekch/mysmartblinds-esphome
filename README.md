@@ -10,7 +10,10 @@ a Bluetooth proxy, and it drives up to two blinds per device.
 For each blind you include, the package creates:
 
 - a **cover** entity in Home Assistant (`device_class: blind`) with open,
-  close and tilt
+  close and tilt, whose state follows the position the motor reports,
+  including moves made with the wand (see [Positions](#positions))
+- configurable **open and close positions** ("smart" open/close, either
+  closing direction) and buttons for the three fixed positions
 - a `ble_client` that connects **only on demand**. It stays disconnected while
   idle, so the radio stays free for scanning and proxying
 - a send script that connects, authenticates with the blind's key, writes the
@@ -18,7 +21,7 @@ For each blind you include, the package creates:
   arrives during a move, it replaces the old one
 - **battery and sensor entities**, read from the motor's indications on every
   connection (see [Sensors](#sensors)): battery %, solar charging, the
-  motor's reported position, a raw light level, and raw diagnostic values
+  motor's reported position, a raw light level, and diagnostic values
 - a **Refresh sensors** button and a **Sensor refresh interval** setting
   (default 10 min), so the sensors stay current between moves
 
@@ -28,17 +31,16 @@ Protocol (all characteristics share the base
 | Characteristic | Direction | Meaning |
 |---|---|---|
 | `00001409` | write | pairing key; must be written first on every connection |
-| `00001403` | write | one position byte: `100` flat/open … `200` closed; tilt maps as `200 - tilt*100` |
-| `00001403` | indicate | a position byte (one motor reported `0x63` = 99); not yet known to follow wand or schedule moves |
+| `00001403` | write | one position byte: `100` flat/open, `200` closed one way, `0` closed the other way (the `0` side is from older community notes, not yet verified) |
+| `00001403` | read / indicate | the motor's position on the same scale; follows wand moves. Right after a move it returns the target until the motor finishes |
 | `00001402` | indicate | status; bytes 0–3 are a little-endian bitfield: `0x00040000` solar charging, `0x00080000` USB charging |
-| `00001651` | indicate | 14 bytes: battery %, reserved, then six little-endian `uint16`: battery voltage, battery charge, solar-panel voltage, interior temperature, battery temperature, raw light |
+| `00001651` | indicate | 14 bytes: battery %, reserved, then six little-endian 16-bit values: battery voltage, battery charge, solar-panel voltage, interior temperature, battery temperature, raw light |
 
 Key and position writes are verified on hardware. The indications come from
 a capture of the official Android app; as in the app, they are enabled only
 after the key has been written. Reading `00001402`/`00001404` directly does
-not return this data. Because it isn't yet known whether the `00001403`
-readback tracks moves made with the wand or the motor's schedules, the cover
-remains `assumed_state` / optimistic.
+not return this data. The `00001403` readback was checked on hardware: it
+reported 199 after closing to 200, and 131 after a move with the wand.
 
 ### Designed to drop into an existing device
 
@@ -93,6 +95,31 @@ see `Connecting to FF:EE:DD:CC:BB:AA (dump MAC AA:BB:CC:DD:EE:FF reversed)`
 followed by `Sending N-byte key`. The first address should match the
 `SmartBlind_DFU` device in a BLE scanner app such as nRF Connect.
 
+## Positions
+
+The motor takes one position byte from `0` to `200`. `100` is flat (fully
+open); `200` closes the slats one way and, according to older community
+notes, `0` closes them the other way. Which of the two is "top of the slats
+toward the room" and which is "toward the window" depends on how the blind is
+mounted, so try both and rename the buttons in Home Assistant if you like.
+
+| Entity (prefixed with `blind_name`) | What it does | Default |
+|---|---|---|
+| the cover's **open** | moves to **Open position** | |
+| the cover's **close** | moves to **Close position** | |
+| the cover's **tilt** slider | 100% = flat, 0% = closed toward the side of **Close position** | |
+| Open position | "smart open": e.g. `80` or `120` to angle the slats for more light | `100`, config |
+| Close position | "smart close": `200` for one direction, `0` (or `1`) for the other | `200`, config |
+| Close (0 side), Open flat, Close (200 side) | buttons: move straight to `0`, `100`, `200`, ignoring the settings | |
+| Reported position (raw) | the position the motor reports, `0`–`200` | enabled |
+
+The cover's state comes from the motor's reported position, converted to
+tilt as `1 - |position - 100| / 100`: 100% at flat, 0% at either closed end,
+and "closed" within 5 steps of an end. It updates on every connection, so a
+wand move shows up at the next refresh. A move from Home Assistant shows the
+target immediately. Open and close stay available at all times, since the
+blind can be moved behind Home Assistant's back.
+
 ## Sensors
 
 Every connection to the blind (each move, each scheduled refresh, each press
@@ -103,9 +130,11 @@ Assistant between connections.
 |---|---|---|
 | Battery | `00001651` byte 0, % | enabled |
 | Solar charging | `00001402` bit `0x00040000` | enabled |
-| Reported position (raw) | `00001403` indication, 0–200 scale; not used by the cover (see above) | enabled |
-| Light level (raw) | `00001651` last `uint16`, not calibrated to lux | enabled |
-| Battery voltage (raw), Battery charge (raw), Solar panel voltage (raw), Interior temperature (raw), Battery temperature (raw) | `00001651` `uint16` fields, units not verified | disabled, diagnostic |
+| Reported position (raw) | `00001403`, 0–200 (see [Positions](#positions)) | enabled |
+| Light level (raw) | `00001651` last value, not calibrated to lux | enabled |
+| Battery voltage, Solar panel voltage | `00001651`, assumed mV, shown in V | disabled, diagnostic |
+| Interior temperature, Battery temperature | `00001651`, assumed 0.1 °C, shown in °C | disabled, diagnostic |
+| Battery charge (raw) | `00001651`, unknown units (so far always equal to the solar panel value) | disabled, diagnostic |
 | USB charging | `00001402` bit `0x00080000` | disabled, diagnostic |
 | Status flags | `00001402` bytes 0–3 as hex | disabled, diagnostic |
 | Refresh sensors | button: connect now and read the sensors | diagnostic |
@@ -126,9 +155,11 @@ the next try waits a full interval.
 Each refresh also holds one of the ESP32's BLE connections for those few
 seconds (see [BLE connection slots](#ble-connection-slots)).
 
-**Calibrating raw values.** Only battery % has known units. Once you have
-worked out a conversion, redeclare the sensor by its ID in your device config
-and add filters. ESPHome merges list entries that share an ID:
+**Units.** Only battery % is known for certain. Volts and °C are inferred
+from readings that look plausible (3.39 V battery, 19.6 °C inside, 24.7 °C
+battery); treat them as unverified. To correct or calibrate a value,
+redeclare the sensor by its ID in your device config and add filters.
+ESPHome merges list entries that share an ID:
 
 ```yaml
 sensor:
@@ -149,7 +180,21 @@ lacks one of the characteristics, the log says
 blind is unaffected. `0x1403` is also read directly on every connection, and
 its log line says whether a value came from that `read` or from an
 `indication`. A connection that ends without hearing from a characteristic
-logs `No data this connection from: …`.
+logs `No data this connection from: …`. Once per boot the log also names
+the service each characteristic belongs to (`0x1651 is in service …`).
+
+ESPHome itself logs a few warnings on every connection that are harmless
+here: `ble_sensor` reports `Disconnected!` because the blind disconnects on
+purpose, and `No sensor characteristic found at service 00001650…` because
+`0x1651`'s service isn't known yet (the package finds it by UUID anyway).
+The related `ble_client.sensor set Warning flag` line comes from the same
+cause. To hide the `ble_sensor` ones, add this to your device config:
+
+```yaml
+logger:
+  logs:
+    ble_sensor: ERROR
+```
 
 ## Usage
 
