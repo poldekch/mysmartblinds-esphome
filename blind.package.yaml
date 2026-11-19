@@ -93,6 +93,12 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+  # Sensor refresh interval in minutes, set via the number entity below and
+  # kept across reboots.
+  - id: ${blind_id}_refresh_min
+    type: float
+    restore_value: true
+    initial_value: '10'
   # millis() of the last connection attempt (move or refresh); 0 = never.
   - id: ${blind_id}_last_refresh
     type: uint32_t
@@ -531,8 +537,11 @@ button:
 number:
   # How often to connect just to read the sensors. Every connection costs the
   # motor some battery; moves refresh the sensors too and reset this timer.
-  # (The id differs from the earlier hours-based version on purpose, so a
-  # stored "6" (hours) isn't restored as 6 minutes.)
+  # The value lives in the restored global ${blind_id}_refresh_min, not in the
+  # number's own restore_value: ESPHome keys a number's saved value by its
+  # entity NAME, so it would bring back the value saved by the earlier
+  # hours-based version of this entity instead of the 10-minute default.
+  # A global's saved value is keyed by its id, which is new.
   - platform: template
     id: ${blind_id}_refresh_minutes
     name: "${blind_name} Sensor refresh interval"
@@ -543,9 +552,11 @@ number:
     max_value: 1440           # 24 h
     step: 1
     mode: box
-    optimistic: true
-    restore_value: true
-    initial_value: 10
+    update_interval: 60s
+    lambda: 'return id(${blind_id}_refresh_min);'
+    set_action:
+      - lambda: 'id(${blind_id}_refresh_min) = x;'
+      - component.update: ${blind_id}_refresh_minutes
 
 interval:
   # Checks every 10 s whether a refresh is due (fine enough for a 1-minute
@@ -556,7 +567,7 @@ interval:
       - if:
           condition:
             lambda: |-
-              float minutes = id(${blind_id}_refresh_minutes).state;
+              float minutes = id(${blind_id}_refresh_min);
               if (isnan(minutes) || minutes < 1) return false;
               uint32_t now = millis();
               uint32_t last = id(${blind_id}_last_refresh);
