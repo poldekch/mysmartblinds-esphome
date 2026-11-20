@@ -438,6 +438,17 @@ script:
           auto *cl = id(${blind_id}_ble);
           esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
           if (err != ESP_OK) ESP_LOGW("${blind_id}", "Reading 0x1402 failed: %d", err);
+      - delay: 300ms
+      # 2c. The motor often sends 00001651 right after the key, sometimes
+      #     before the key's write is confirmed, and that indication is
+      #     ignored. If it hasn't arrived by now, read it directly.
+      - lambda: |-
+          uint16_t handle = id(${blind_id}_handles)[0];
+          if (handle == 0 || (id(${blind_id}_got) & 1)) return;
+          ESP_LOGD("${blind_id}", "0x1651 not received yet; reading it");
+          auto *cl = id(${blind_id}_ble);
+          esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
+          if (err != ESP_OK) ESP_LOGW("${blind_id}", "Reading 0x1651 failed: %d", err);
       - delay: 200ms
       # 3. Moves. Loops, so a command that arrives while connected (e.g. one
       #    interrupting a silent move) is handled on this same connection.

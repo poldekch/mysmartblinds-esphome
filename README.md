@@ -318,8 +318,9 @@ lacks one of the characteristics, the log says
 blind is unaffected. `0x1403` is also read directly on every connection, and
 its log line says whether a value came from that `read` or from an
 `indication`. A connection that ends without hearing from a characteristic
-logs `No data this connection from: …`. The status (`0x1402`) is read
-directly after the key too, and a warning is logged when it shows a refused
+logs `No data this connection from: …`. If `0x1651` hasn't arrived shortly
+after the key, it is read directly (`0x1651 not received yet; reading it`).
+The status (`0x1402`) is read directly after the key too, and a warning is logged when it shows a refused
 key, a battery lockout, over temperature or a motor that isn't calibrated.
 
 **Read pairing key.** This button is for a motor that was factory reset or
