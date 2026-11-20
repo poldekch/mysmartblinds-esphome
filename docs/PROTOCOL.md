@@ -85,9 +85,12 @@ Two things are still unknown (guess):
 
 - **The app's format.** It writes the 6-byte passkey followed by `01`. If the
   stored key is longer than 6 bytes, it first drops the key's first byte.
-- **What this package does.** It now writes the key the app's way (6 bytes +
-  `01`). Earlier versions wrote only the 6 key bytes, which also worked on the
-  motors tested (verified).
+- **What this package does.** It writes the key the app's way (6 bytes +
+  `01`), which the motor accepts (verified). Earlier versions wrote only the
+  6 key bytes, which also worked (verified).
+- **Reading `1409` on a paired motor** returns `FF` × 7 (verified), so a
+  paired motor doesn't give its key away. Whether an unpaired one does is
+  still to be tested.
 - **The unlock result.** The motor reports the outcome in `1402` (bit 31
   valid, bit 30 invalid) and, if refused, as a NACK on `1407` (see
   [NACK reasons](#nack-reasons)).
@@ -95,7 +98,10 @@ Two things are still unknown (guess):
 ## 1402 Status
 
 Bytes 0–3 form a 32-bit little-endian value. The low bits are commands (you set
-them by writing). The upper bits report state (the motor sets them).
+them by writing). The upper bits report state (the motor sets them). A direct
+read after the key returns 8 bytes, the flags followed by 4 zero bytes
+(verified). A working, calibrated blind read `0xA0110000`: key valid, paired,
+clock set, calibrated.
 
 | Bit | Mask | Name | Meaning |
 |---|---|---|---|
@@ -107,7 +113,7 @@ them by writing). The upper bits report state (the motor sets them).
 | 14 | `0x00004000` | ResetFlash | command: **factory reset** |
 | 15 | `0x00008000` | Disconnect | command: disconnect |
 | 16 | `0x00010000` | IsCalibrated | calibrated. When clear, the app shows "needs calibration". |
-| 17 | `0x00020000` | HasSolar | solar panel present |
+| 17 | `0x00020000` | HasSolar | solar panel present according to the app's name. A blind with its panel fitted read `0` at night (verified), so it may really mean "the panel is giving power". |
 | 18 | `0x00040000` | IsChargingSolar | charging from solar (verified) |
 | 19 | `0x00080000` | IsChargingUSB | charging from USB (verified) |
 | 20 | `0x00100000` | IsTimeValid | the clock has been set |
