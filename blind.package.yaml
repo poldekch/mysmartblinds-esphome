@@ -239,8 +239,19 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
+  # Read pairing key button: read 00001409 on the next connection, before the
+  # key is written; key_got is set once the read answered.
+  - id: ${blind_id}_key_read
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ${blind_id}_key_got
+    type: bool
+    restore_value: false
+    initial_value: 'false'
   # Attribute handles found during service discovery, per connection.
-  # Characteristic value handles of 00001651 / 00001402 / 00001403 (0 = absent).
+  # Characteristic value handles of 00001651 / 00001402 / 00001403 / 00001409
+  # (0 = absent).
   - id: ${blind_id}_handles
     type: std::vector<uint16_t>
     restore_value: false
@@ -273,10 +284,12 @@ ble_client:
             auto *cl = id(${blind_id}_ble);
             // 128-bit UUIDs in the stack's little-endian layout; bytes 12-13
             // hold the 16-bit short ID (0x1651 etc.).
-            static const uint16_t shorts[3] = {0x1651, 0x1402, 0x1403};
-            std::vector<uint16_t> handles(3, 0);
+            // The fourth, 00001409 (passkey), is only read on request (the
+            // Read pairing key button), never subscribed.
+            static const uint16_t shorts[4] = {0x1651, 0x1402, 0x1403, 0x1409};
+            std::vector<uint16_t> handles(4, 0);
             std::vector<uint32_t> cccds;
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 4; i++) {
               esp_bt_uuid_t uuid = {};
               uuid.len = ESP_UUID_LEN_128;
               const uint8_t base[16] = {0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x00, 0x16,
@@ -292,6 +305,7 @@ ble_client:
                 continue;
               }
               handles[i] = chr.char_handle;
+              if (i == 3) continue;
               esp_bt_uuid_t cccd_uuid = {};
               cccd_uuid.len = ESP_UUID_LEN_16;
               cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
@@ -342,8 +356,32 @@ script:
     mode: restart
     then:
       - delay: 200ms
-      # 1. Authenticate: write the key to 00001409. The hex digits are paired
-      #    into bytes in order; "0x" prefixes and separators are skipped.
+      # 0. Read pairing key button: read 00001409 before writing the key. On
+      #    an unpaired motor the official app reads its new key this way.
+      - if:
+          condition:
+            lambda: 'return id(${blind_id}_key_read) && id(${blind_id}_handles)[3] != 0;'
+          then:
+            - lambda: |-
+                id(${blind_id}_key_read) = false;
+                id(${blind_id}_key_got) = false;
+                id(${blind_id}_key_raw)->handle = id(${blind_id}_handles)[3];
+                auto *cl = id(${blind_id}_ble);
+                esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(),
+                                                        id(${blind_id}_handles)[3], ESP_GATT_AUTH_REQ_NONE);
+                if (err != ESP_OK) {
+                  ESP_LOGW("${blind_id}", "Reading 0x1409 failed: %d", err);
+                  id(${blind_id}_key_got) = true;
+                }
+            - wait_until:
+                condition:
+                  lambda: 'return id(${blind_id}_key_got);'
+                timeout: 3s
+            - lambda: |-
+                if (!id(${blind_id}_key_got)) ESP_LOGW("${blind_id}", "0x1409: no answer to the read");
+      # 1. Authenticate: write the key to 00001409, followed by 0x01 as the
+      #    official app does. The hex digits are paired into bytes in order;
+      #    "0x" prefixes and separators are skipped.
       - ble_client.ble_write:
           id: ${blind_id}_ble
           service_uuid: '00001400-1212-efde-1600-785feabcd123'
@@ -362,6 +400,9 @@ script:
             for (size_t i = 0; i + 1 < hex.size(); i += 2) {
               out.push_back((uint8_t) strtol(hex.substr(i, 2).c_str(), nullptr, 16));
             }
+            // The app writes the 6-byte passkey + 0x01. Keys of any other
+            // length are sent unchanged.
+            if (out.size() == 6) out.push_back(0x01);
             ESP_LOGD("${blind_id}", "Sending %u-byte key", (unsigned) out.size());
             return out;
       - delay: 200ms
@@ -388,6 +429,16 @@ script:
                                                                ESP_GATT_AUTH_REQ_NONE);
                 if (err != ESP_OK) ESP_LOGW("${blind_id}", "Enabling indications at 0x%04X failed: %d", handle, err);
             - delay: 100ms
+      # 2b. Read the status explicitly: indications sent before the key are
+      #     ignored, so this makes sure every connection has fresh flags
+      #     (including whether the key was accepted).
+      - lambda: |-
+          uint16_t handle = id(${blind_id}_handles)[1];
+          if (handle == 0) return;
+          auto *cl = id(${blind_id}_ble);
+          esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
+          if (err != ESP_OK) ESP_LOGW("${blind_id}", "Reading 0x1402 failed: %d", err);
+      - delay: 200ms
       # 3. Moves. Loops, so a command that arrives while connected (e.g. one
       #    interrupting a silent move) is handled on this same connection.
       - while:
@@ -780,8 +831,19 @@ sensor:
       }
       uint32_t flags = (uint32_t) x[0] | ((uint32_t) x[1] << 8) | ((uint32_t) x[2] << 16) | ((uint32_t) x[3] << 24);
       ESP_LOGD("${blind_id}", "0x1402: %s (flags 0x%08X)", format_hex_pretty(x).c_str(), (unsigned) flags);
+      // Bit meanings from the official app; see docs/PROTOCOL.md.
       id(${blind_id}_solar_charging).publish_state(flags & 0x00040000);
       id(${blind_id}_usb_charging).publish_state(flags & 0x00080000);
+      id(${blind_id}_key_accepted).publish_state(flags & 0x80000000);
+      id(${blind_id}_paired).publish_state(flags & 0x20000000);
+      id(${blind_id}_calibrated).publish_state(flags & 0x00010000);
+      id(${blind_id}_solar_panel).publish_state(flags & 0x00020000);
+      id(${blind_id}_lockout).publish_state(flags & 0x00200000);
+      id(${blind_id}_over_temp).publish_state(flags & 0x00400000);
+      if (flags & 0x40000000) ESP_LOGW("${blind_id}", "The motor refused the key (check blind_key)");
+      if (flags & 0x00200000) ESP_LOGW("${blind_id}", "Battery too low: the motor has locked itself until it charges");
+      if (flags & 0x00400000) ESP_LOGW("${blind_id}", "The motor reports over temperature");
+      if (!(flags & 0x00010000)) ESP_LOGW("${blind_id}", "The motor reports it is not calibrated");
       char buf[11];
       snprintf(buf, sizeof(buf), "0x%08X", (unsigned) flags);
       id(${blind_id}_status_flags).publish_state(buf);
@@ -809,6 +871,29 @@ sensor:
       // the value indicated then is the position BEFORE the move.
       if (!id(${blind_id}_move_pending)) id(${blind_id}_show)->execute(x[0]);
       id(${blind_id}_got) |= 4;
+      return NAN;
+
+  # 00001409 (passkey), read only when the Read pairing key button asks for
+  # it. Logs every byte and shows the first six, formatted for blind_key.
+  - platform: ble_client
+    type: characteristic
+    id: ${blind_id}_key_raw
+    internal: true
+    ble_client_id: ${blind_id}_ble
+    service_uuid: '00001400-1212-efde-1600-785feabcd123'
+    characteristic_uuid: '00001409-1212-efde-1600-785feabcd123'
+    update_interval: never
+    lambda: |-
+      if (id(${blind_id}_key_got)) return NAN;
+      id(${blind_id}_key_got) = true;
+      ESP_LOGI("${blind_id}", "0x1409 (read): %s", format_hex_pretty(x).c_str());
+      std::string key;
+      for (size_t i = 0; i < x.size() && i < 6; i++) {
+        char b[8];
+        snprintf(b, sizeof(b), "%s0x%02X", i ? ", " : "", x[i]);
+        key += b;
+      }
+      id(${blind_id}_key_text).publish_state(x.empty() ? "(empty)" : key);
       return NAN;
 
   # --- Entities shown in Home Assistant. They keep their last value between
@@ -913,8 +998,52 @@ binary_sensor:
     icon: mdi:usb-port
     entity_category: diagnostic
     disabled_by_default: true
+  # Motor status bits (00001402), refreshed on every connection.
+  - platform: template
+    id: ${blind_id}_key_accepted
+    name: "${blind_name} Key accepted"
+    icon: mdi:key
+    entity_category: diagnostic
+  - platform: template
+    id: ${blind_id}_paired
+    name: "${blind_name} Paired"
+    icon: mdi:link
+    entity_category: diagnostic
+    disabled_by_default: true
+  - platform: template
+    id: ${blind_id}_calibrated
+    name: "${blind_name} Calibrated"
+    icon: mdi:tune-vertical
+    entity_category: diagnostic
+  - platform: template
+    id: ${blind_id}_solar_panel
+    name: "${blind_name} Solar panel"
+    device_class: plug
+    icon: mdi:solar-panel
+    entity_category: diagnostic
+  - platform: template
+    id: ${blind_id}_lockout
+    name: "${blind_name} Battery lockout"
+    device_class: problem
+    icon: mdi:battery-alert
+    entity_category: diagnostic
+  - platform: template
+    id: ${blind_id}_over_temp
+    name: "${blind_name} Over temperature"
+    device_class: problem
+    icon: mdi:thermometer-alert
+    entity_category: diagnostic
 
 text_sensor:
+  # What the Read pairing key button got from 00001409: the first six bytes,
+  # formatted like blind_key.
+  - platform: template
+    id: ${blind_id}_key_text
+    name: "${blind_name} Pairing key read"
+    icon: mdi:key-variant
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
   # First four bytes of the 00001402 status indication, for protocol research.
   - platform: template
     id: ${blind_id}_status_flags
@@ -931,6 +1060,18 @@ button:
     icon: mdi:refresh
     entity_category: diagnostic
     on_press:
+      - script.execute: ${blind_id}_refresh
+  # Diagnostic: on the next connection, read the motor's passkey characteristic
+  # before unlocking and show the result in "Pairing key read" (and the log).
+  # Read only; nothing is written to the motor beyond the usual key.
+  - platform: template
+    id: ${blind_id}_read_key_button
+    name: "${blind_name} Read pairing key"
+    icon: mdi:key-chain-variant
+    entity_category: diagnostic
+    disabled_by_default: true
+    on_press:
+      - lambda: 'id(${blind_id}_key_read) = true;'
       - script.execute: ${blind_id}_refresh
   # Direct moves to the three fixed positions, regardless of the open/close
   # settings. On the blind this was verified on, 0 tips the room edge of the

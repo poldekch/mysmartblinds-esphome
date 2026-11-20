@@ -33,17 +33,23 @@ Protocol (all characteristics share the base
 
 | Characteristic | Direction | Meaning |
 |---|---|---|
-| `00001409` | write | pairing key; must be written first on every connection |
+| `00001409` | write | pairing key; must be written first on every connection. A 6-byte key is sent followed by `0x01`, as the official app does |
+| `00001409` | read | on an unpaired motor, the official app reads its new key here (see the **Read pairing key** button) |
 | `00001403` | write | one position byte: `100` flat/open, `0` and `200` closed in opposite directions |
 | `00001403` | read / indicate | the motor's position on the same scale; follows wand moves. Right after a move it returns the target until the motor finishes |
-| `00001402` | indicate | status; bytes 0–3 are a little-endian bitfield: `0x00040000` solar charging, `0x00080000` USB charging |
+| `00001402` | read / indicate | status; bytes 0–3 are a little-endian bitfield, e.g. `0x80000000` key accepted, `0x00010000` calibrated, `0x00040000` solar charging, `0x00200000` battery lockout. Read directly after the key on every connection |
 | `00001651` | indicate | 14 bytes: battery %, reserved, then six little-endian 16-bit values: battery voltage, battery charge, solar-panel voltage, interior temperature, battery temperature, raw light |
 
 Key and position writes are verified on hardware. The indications come from
 a capture of the official Android app; as in the app, they are enabled only
-after the key has been written. Reading `00001402`/`00001404` directly does
-not return this data. The `00001403` readback was checked on hardware: it
-reported 199 after closing to 200, and 131 after a move with the wand.
+after the key has been written. The `00001403` readback was checked on
+hardware: it reported 199 after closing to 200, and 131 after a move with the
+wand.
+
+The full protocol as the official app uses it (status bits, pairing,
+calibration, the motor's own schedule and sun tracking, energy savings) is
+written up in [docs/PROTOCOL.md](docs/PROTOCOL.md), with each part marked as
+verified on hardware or taken from the app only.
 
 ### Designed to drop into an existing device
 
@@ -85,6 +91,9 @@ converts them itself:
   is sent as `[0x0A, 0x1B, 0x2C, 0x3D]`, which is the byte list the forum
   example writes by hand. That list format (`"0x0A, 0x1B, 0x2C, 0x3D"`) is
   accepted as well. The key's length varies between blinds; send all of it.
+  A 6-byte key goes out with `0x01` appended, as the official app sends it
+  (the log then says `Sending 7-byte key`); keys of other lengths are sent
+  unchanged.
 
 | var          | meaning                                                  |
 |--------------|----------------------------------------------------------|
@@ -257,8 +266,16 @@ Assistant between connections.
 | Interior temperature, Battery temperature | `00001651`, assumed 0.1 °C, shown in °C | disabled, diagnostic |
 | Battery charge (raw) | `00001651`, unknown units (so far always equal to the solar panel value) | disabled, diagnostic |
 | USB charging | `00001402` bit `0x00080000` | disabled, diagnostic |
+| Key accepted | `00001402` bit `0x80000000`: the motor accepted `blind_key` | diagnostic |
+| Calibrated | `00001402` bit `0x00010000` | diagnostic |
+| Solar panel | `00001402` bit `0x00020000`: a solar panel is connected | diagnostic |
+| Battery lockout | `00001402` bit `0x00200000`: battery too low, the motor won't move (not even from the wand) until it charges | diagnostic |
+| Over temperature | `00001402` bit `0x00400000` | diagnostic |
+| Paired | `00001402` bit `0x20000000` | disabled, diagnostic |
 | Status flags | `00001402` bytes 0–3 as hex | disabled, diagnostic |
 | Refresh sensors | button: connect now and read the sensors | diagnostic |
+| Read pairing key | button: on the next connection, read `00001409` before unlocking and show the result in **Pairing key read** | disabled, diagnostic |
+| Pairing key read | first six bytes the button got, formatted like `blind_key` | disabled, diagnostic |
 | Sensor refresh interval | minutes between sensor-only connections, `1`–`1440` (24 h) | `10`, config |
 
 The disabled entities can be enabled from the device page in Home Assistant.
@@ -301,7 +318,16 @@ lacks one of the characteristics, the log says
 blind is unaffected. `0x1403` is also read directly on every connection, and
 its log line says whether a value came from that `read` or from an
 `indication`. A connection that ends without hearing from a characteristic
-logs `No data this connection from: …`.
+logs `No data this connection from: …`. The status (`0x1402`) is read
+directly after the key too, and a warning is logged when it shows a refused
+key, a battery lockout, over temperature or a motor that isn't calibrated.
+
+**Read pairing key.** This button is for a motor that was factory reset or
+whose key no longer works. It reads the motor's passkey characteristic
+before unlocking; the log shows every byte (`0x1409 (read): …`) and
+**Pairing key read** shows the first six, ready to paste into `blind_key`.
+It is read only. On a paired motor the result may not be a usable key; the
+official app reads it only while adding a new or reset blind.
 
 ESPHome itself logs a couple of warnings on every connection that are
 harmless here: `ble_sensor` reports `Disconnected!`, and `component` reports
