@@ -184,7 +184,9 @@ The app retries the read up to 6 times, 200 ms apart, if any field reads 0.
 - byte 4: day of the month
 - byte 5: seconds, with bit 7 set while daylight saving time is in effect
 
-The app writes this after every unlock.
+The app writes this after every unlock. This package writes it on the first
+connection after boot, then every 12 hours, and right away when `IsTimeValid`
+is clear.
 
 ## 1407 RxTx (command channel)
 
@@ -331,6 +333,9 @@ point it moves to the energy savings position, and below the set point minus
 the hysteresis it goes back if "resume" is on. While it is in control, status
 bit 23 (TempOverride) is set. That the wand toggles between the smart open and
 smart close positions is a guess.
+
+This package always writes all 8 bytes, with the enabled flag cleared when
+too-hot mode is off: once after each ESP boot, and whenever a setting changes.
 
 ## 1651 Sensors
 

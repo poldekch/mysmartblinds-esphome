@@ -27,6 +27,11 @@ For each blind you include, the package creates:
   motor's reported position, a raw light level, and diagnostic values
 - a **Refresh sensors** button and a **Sensor refresh interval** setting
   (default 10 min), so the sensors stay current between moves
+- the motor's own **too-hot mode**, switchable from Home Assistant: above a
+  set temperature the motor closes by itself, even with the ESP offline (see
+  [Too-hot mode](#too-hot-mode))
+- **clock sync**: the motor's clock is set from Home Assistant's time on the
+  first connection after boot and every 12 hours
 
 Protocol (all characteristics share the base
 `xxxxxxxx-1212-efde-1600-785feabcd123`):
@@ -250,6 +255,45 @@ Positions are raw (`0`–`200`, `100` = flat; `3`–`197` on a sticky blind) and
 follow the same rules as the buttons. The package adds these actions to your
 device's `api:` block; they merge with any actions you already have.
 
+## Too-hot mode
+
+The motor has its own "too hot" rule (called energy savings in the official
+app). When the temperature measured by the motor itself goes above a set
+point, it moves to a set position; once it is 3 °C cooler it can go back to
+where it was. Because the motor runs the rule, it keeps working when the ESP
+or Home Assistant is down.
+
+| Entity (prefixed with `blind_name`) | What it does | Default |
+|---|---|---|
+| Too-hot mode | switch: turn the motor's rule on or off | off, config |
+| Too-hot temperature | the set point, `16`–`40` °C (the app's range) | `28`, config |
+| Too-hot position | where the blind goes when it's too hot (raw `0`–`200`; `3`–`197` on a sticky blind) | `200`, config |
+| Too-hot resume | switch: go back to the previous position once 3 °C cooler | on, config |
+| Too-hot active | the motor reports that the rule has taken over | |
+
+- **How the settings reach the motor.** They are written about 3 seconds
+  after you change one, and once after every boot of the ESP, since the
+  motor's copy can't be read back. The same write carries the **Open
+  position** and **Close position** as the motor's own "smart" open and
+  close positions, which the wand may use.
+- **Time needed.** The write includes a timestamp from Home Assistant's
+  time, so it waits until the ESP has the time. The log line
+  `Room settings: open …, close …, too-hot on at 28.0 C -> 200, resume`
+  shows what was written.
+- **The motor's own sensor.** The rule uses the motor's interior temperature
+  (the **Interior temperature** entity). If that reads 0, as on a motor with
+  a sensor fault, the rule never triggers.
+- **Not yet verified on hardware.** This comes from the official app's code.
+  To test it, set the temperature just below the room's and watch whether
+  the blind moves by itself and **Too-hot active** turns on.
+
+**Clock sync.** On the first connection after boot, then every 12 hours, the
+package sets the motor's clock from Home Assistant's time (log:
+`Setting the motor's clock: …`). If the motor reports its clock isn't set
+(**Clock set** off, for example after a factory reset), it is set on the next
+connection. The package adds a Home Assistant `time:` source per blind for
+this; it doesn't change any time source you already have.
+
 ## Sensors
 
 Every connection to the blind (each move, each scheduled refresh, each press
@@ -271,6 +315,7 @@ Assistant between connections.
 | Solar panel | `00001402` bit `0x00020000`: a solar panel is connected | diagnostic |
 | Battery lockout | `00001402` bit `0x00200000`: battery too low, the motor won't move (not even from the wand) until it charges | diagnostic |
 | Over temperature | `00001402` bit `0x00400000` | diagnostic |
+| Clock set | `00001402` bit `0x00100000`: the motor's clock is valid | diagnostic |
 | Paired | `00001402` bit `0x20000000` | disabled, diagnostic |
 | Status flags | `00001402` bytes 0–3 as hex | disabled, diagnostic |
 | Refresh sensors | button: connect now and read the sensors | diagnostic |

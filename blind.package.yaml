@@ -239,6 +239,23 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
+  # millis() of the last clock sync to the motor (00001405); 0 = not since
+  # boot. Synced on the first connection, then every 12 h, and right away
+  # when the motor reports its clock as not set (clock_ok, from 00001402).
+  - id: ${blind_id}_time_synced
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_clock_ok
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  # Room settings (00001603: smart open/close + too-hot rule) still to be
+  # written. True after boot, since the motor's copy can't be read back.
+  - id: ${blind_id}_room_dirty
+    type: bool
+    restore_value: false
+    initial_value: 'true'
   # Read pairing key button: read 00001409 on the next connection, before the
   # key is written; key_got is set once the read answered.
   - id: ${blind_id}_key_read
@@ -450,6 +467,73 @@ script:
           esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
           if (err != ESP_OK) ESP_LOGW("${blind_id}", "Reading 0x1651 failed: %d", err);
       - delay: 200ms
+      # 2d. Clock sync (00001405), in the official app's format: minute of
+      #     the week from Sunday 00:00 in local STANDARD time, year - 2000,
+      #     month, day, seconds with bit 7 set during daylight saving time.
+      #     First connection after boot, then every 12 h, or right away if
+      #     the motor says its clock isn't set. Needs Home Assistant time.
+      - if:
+          condition:
+            lambda: |-
+              if (!id(${blind_id}_time).now().is_valid()) return false;
+              uint32_t last = id(${blind_id}_time_synced);
+              return last == 0 || !id(${blind_id}_clock_ok) || millis() - last >= 12UL * 3600UL * 1000UL;
+          then:
+            - ble_client.ble_write:
+                id: ${blind_id}_ble
+                service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                characteristic_uuid: '00001405-1212-efde-1600-785feabcd123'
+                value: !lambda |-
+                  ESPTime now = id(${blind_id}_time).now();
+                  // Local standard time: UTC + current offset, minus the
+                  // DST hour while DST is in effect.
+                  time_t t = now.timestamp + ESPTime::timezone_offset() - (now.is_dst ? 3600 : 0);
+                  ESPTime s = ESPTime::from_epoch_utc(t);
+                  uint16_t mow = (s.day_of_week - 1) * 1440 + s.hour * 60 + s.minute;
+                  ESP_LOGI("${blind_id}", "Setting the motor's clock: %04u-%02u-%02u %02u:%02u:%02u standard time%s",
+                           s.year, s.month, s.day_of_month, s.hour, s.minute, s.second, now.is_dst ? " (DST)" : "");
+                  return std::vector<uint8_t>{(uint8_t) (mow & 0xFF), (uint8_t) (mow >> 8), (uint8_t) (s.year - 2000),
+                                              s.month, s.day_of_month,
+                                              (uint8_t) (s.second | (now.is_dst ? 0x80 : 0))};
+            - lambda: |-
+                id(${blind_id}_time_synced) = std::max<uint32_t>(1, millis());
+                id(${blind_id}_clock_ok) = true;
+            - delay: 200ms
+      # 2e. Room settings (00001603), when changed and once after boot:
+      #     reference time (seconds since 2001-01-01, LE), smart open, smart
+      #     close, too-hot temperature (s16 LE, 0.1 degC), too-hot position,
+      #     flags (bit 0 enabled, bit 1 resume), hysteresis 3.0 degC, 0.
+      #     The reference time comes from Home Assistant, so this waits for
+      #     it to be valid.
+      - if:
+          condition:
+            lambda: 'return id(${blind_id}_room_dirty) && id(${blind_id}_time).now().is_valid();'
+          then:
+            - lambda: 'id(${blind_id}_room_dirty) = false;'
+            - ble_client.ble_write:
+                id: ${blind_id}_ble
+                service_uuid: '00001400-1212-efde-1600-785feabcd123'
+                characteristic_uuid: '00001603-1212-efde-1600-785feabcd123'
+                value: !lambda |-
+                  const int m = id(${blind_id}_margin);
+                  auto clamp = [m](int p) { return (uint8_t) std::max(m, std::min(200 - m, p)); };
+                  uint32_t ref = (uint32_t) (id(${blind_id}_time).now().timestamp - 978307200);
+                  uint8_t open = clamp(id(${blind_id}_open_pos));
+                  uint8_t close = clamp(id(${blind_id}_close_pos));
+                  float temp_c = id(${blind_id}_hot_temperature).state;
+                  if (std::isnan(temp_c)) temp_c = 28.0f;
+                  int16_t temp = (int16_t) lroundf(std::max(16.0f, std::min(40.0f, temp_c)) * 10.0f);
+                  float pos_f = id(${blind_id}_hot_position).state;
+                  uint8_t pos = clamp(std::isnan(pos_f) ? 200 : (int) pos_f);
+                  bool on = id(${blind_id}_hot_mode).state;
+                  bool resume = id(${blind_id}_hot_resume).state;
+                  uint8_t flags = (on ? 1 : 0) | (resume ? 2 : 0);
+                  ESP_LOGI("${blind_id}", "Room settings: open %u, close %u, too-hot %s at %.1f C -> %u%s", open, close,
+                           on ? "on" : "off", temp / 10.0f, pos, resume ? ", resume" : "");
+                  return std::vector<uint8_t>{(uint8_t) ref, (uint8_t) (ref >> 8), (uint8_t) (ref >> 16), (uint8_t) (ref >> 24),
+                                              open, close, (uint8_t) (temp & 0xFF), (uint8_t) ((uint16_t) temp >> 8),
+                                              pos, flags, 30, 0};
+            - delay: 200ms
       # 3. Moves. Loops, so a command that arrives while connected (e.g. one
       #    interrupting a silent move) is handled on this same connection.
       - while:
@@ -749,6 +833,23 @@ script:
           c->current_operation = (cover::CoverOperation) id(${blind_id}_op);
           c->publish_state();
 
+  # A room setting changed (open/close position, too-hot settings): mark it
+  # for writing and connect soon. The 3 s pause lets several quick changes go
+  # out together; a connection already running is let finish first.
+  - id: ${blind_id}_apply
+    mode: restart
+    then:
+      - lambda: 'id(${blind_id}_room_dirty) = true;'
+      - delay: 3s
+      - wait_until:
+          condition:
+            lambda: 'return !id(${blind_id}_send).is_running();'
+      - if:
+          condition:
+            lambda: 'return id(${blind_id}_room_dirty);'
+          then:
+            - script.execute: ${blind_id}_send
+
   # Sensor refresh without moving. Never interrupts a move in progress (that
   # move refreshes the sensors anyway).
   - id: ${blind_id}_refresh
@@ -851,6 +952,9 @@ sensor:
       id(${blind_id}_solar_panel).publish_state(flags & 0x00020000);
       id(${blind_id}_lockout).publish_state(flags & 0x00200000);
       id(${blind_id}_over_temp).publish_state(flags & 0x00400000);
+      id(${blind_id}_hot_active).publish_state(flags & 0x00800000);
+      id(${blind_id}_clock_set).publish_state(flags & 0x00100000);
+      id(${blind_id}_clock_ok) = flags & 0x00100000;
       if (flags & 0x40000000) ESP_LOGW("${blind_id}", "The motor refused the key (check blind_key)");
       if (flags & 0x00200000) ESP_LOGW("${blind_id}", "Battery too low: the motor has locked itself until it charges");
       if (flags & 0x00400000) ESP_LOGW("${blind_id}", "The motor reports over temperature");
@@ -1038,6 +1142,16 @@ binary_sensor:
     device_class: problem
     icon: mdi:battery-alert
     entity_category: diagnostic
+  # The motor's too-hot rule has taken over (00001402 bit 0x00800000).
+  - platform: template
+    id: ${blind_id}_hot_active
+    name: "${blind_name} Too-hot active"
+    icon: mdi:sun-thermometer-outline
+  - platform: template
+    id: ${blind_id}_clock_set
+    name: "${blind_name} Clock set"
+    icon: mdi:clock-check-outline
+    entity_category: diagnostic
   - platform: template
     id: ${blind_id}_over_temp
     name: "${blind_name} Over temperature"
@@ -1180,6 +1294,7 @@ number:
     set_action:
       - lambda: 'id(${blind_id}_open_pos) = (int) x;'
       - component.update: ${blind_id}_open_position
+      - script.execute: ${blind_id}_apply
   - platform: template
     id: ${blind_id}_close_position
     name: "${blind_name} Close position"
@@ -1197,6 +1312,7 @@ number:
     set_action:
       - lambda: 'id(${blind_id}_close_pos) = (int) x;'
       - component.update: ${blind_id}_close_position
+      - script.execute: ${blind_id}_apply
 
   # How long a silent move takes, whatever its distance.
   - platform: template
@@ -1214,6 +1330,73 @@ number:
     set_action:
       - lambda: 'id(${blind_id}_silent_s) = x;'
       - component.update: ${blind_id}_silent_duration
+
+  # Too-hot rule, run by the motor itself (see the Too-hot mode switch).
+  # Above this interior temperature (the motor's own sensor) the motor moves
+  # to the too-hot position; it resumes once 3 degC cooler, if enabled.
+  - platform: template
+    id: ${blind_id}_hot_temperature
+    name: "${blind_name} Too-hot temperature"
+    icon: mdi:thermometer-high
+    entity_category: config
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 16
+    max_value: 40
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 28
+    set_action:
+      - script.execute: ${blind_id}_apply
+  - platform: template
+    id: ${blind_id}_hot_position
+    name: "${blind_name} Too-hot position"
+    icon: mdi:blinds
+    entity_category: config
+    min_value: ${ 3 if (sticky_blind | string | lower) == "true" else 0 }
+    max_value: ${ 197 if (sticky_blind | string | lower) == "true" else 200 }
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: ${ 197 if (sticky_blind | string | lower) == "true" else 200 }
+    set_action:
+      - script.execute: ${blind_id}_apply
+
+switch:
+  # The motor's own too-hot rule ("energy savings" in the official app). It
+  # works without the ESP or Home Assistant once written to the motor.
+  - platform: template
+    id: ${blind_id}_hot_mode
+    name: "${blind_name} Too-hot mode"
+    icon: mdi:sun-thermometer
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - script.execute: ${blind_id}_apply
+    turn_off_action:
+      - script.execute: ${blind_id}_apply
+  # Return to the previous position once the room is 3 degC cooler.
+  - platform: template
+    id: ${blind_id}_hot_resume
+    name: "${blind_name} Too-hot resume"
+    icon: mdi:restore
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - script.execute: ${blind_id}_apply
+    turn_off_action:
+      - script.execute: ${blind_id}_apply
+
+# Home Assistant time, for syncing the motor's clock and the room settings'
+# timestamp. Kept per blind; it doesn't affect a time source you already have.
+time:
+  - platform: homeassistant
+    id: ${blind_id}_time
 
 # Home Assistant actions for automations, merged into the device's api:
 # block: esphome.<device>_<blind_id>_move / _silent_move, each taking a raw
