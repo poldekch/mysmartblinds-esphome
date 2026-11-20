@@ -180,7 +180,7 @@ where the motor is now to the target, a little at a time.
 |---|---|---|
 | Silent open | silent move to **Open position** | |
 | Silent close | silent move to **Close position** | |
-| Silent move duration | how long a silent move takes, whatever its distance: `15`–`1800` s | `100`, config |
+| Silent move duration | how long a silent move takes, whatever its distance: `30`–`1800` s | `100`, config |
 | action `<blind_id>_move` | fast move to any `position` (`0`–`200`) | |
 | action `<blind_id>_silent_move` | silent move to any `position` (`0`–`200`) | |
 
@@ -191,7 +191,7 @@ unit, at most one every 0.5 s, spread evenly over the duration. For example:
 | Move | Duration | Steps |
 |---|---|---|
 | 80 → 197 | 100 s | 117 steps of 1, every 0.85 s |
-| 80 → 197 | 15 s | 30 steps of about 4, every 0.5 s |
+| 80 → 197 | 30 s | 60 steps of about 2, every 0.5 s |
 | 120 → 130 | 100 s | 10 steps of 1, every 10 s |
 
 While it runs, the cover shows *opening* or *closing* and its tilt follows

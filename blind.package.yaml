@@ -74,7 +74,7 @@
 #
 # Silent moves: the motor has no slow mode of its own, so a silent move holds
 # one connection and steps the position byte from the motor's current
-# position to the target over "Silent move duration" (15-1800 s, default
+# position to the target over "Silent move duration" (30-1800 s, default
 # 100 s): at most one write per 0.5 s, at least 1 unit per step. Any other
 # move cancels it. Triggered by the Silent open / Silent close buttons or the
 # <blind_id>_silent_move API action; fast moves by the cover or the
@@ -1053,7 +1053,7 @@ number:
     icon: mdi:timer-sand
     entity_category: config
     unit_of_measurement: s
-    min_value: 15
+    min_value: 30
     max_value: 1800
     step: 1
     mode: box
