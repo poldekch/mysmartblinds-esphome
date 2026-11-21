@@ -236,6 +236,10 @@ the other way (`0`).
 | MOVE (jog) | `62 01 <speed>` | none. Speed is a signed byte, about −95..+95; the sign gives the direction. |
 | MOVE TO point | `63 01 <point>` | ACK naming `0x63` |
 
+This package's **Check calibration** button sends the four GET commands
+(direction, TOP, MIDDLE, BOTTOM) and logs every answer on `1407`. Not yet
+verified on hardware.
+
 ### The app's calibration screens, in order
 
 Each point is calibrated the same way:

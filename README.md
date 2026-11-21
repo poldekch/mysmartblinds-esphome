@@ -321,6 +321,8 @@ Assistant between connections.
 | Refresh sensors | button: connect now and read the sensors | diagnostic |
 | Read pairing key | button: on the next connection, read `00001409` before unlocking and show the result in **Pairing key read** | disabled, diagnostic |
 | Pairing key read | first six bytes the button got, formatted like `blind_key` | disabled, diagnostic |
+| Check calibration | button: on the next connection, ask the motor (over `00001407`) for its direction and whether the 0 end, flat and 200 end are calibrated. Read only | disabled, diagnostic |
+| Calibration check | what the button got, e.g. `direction normal, 200 end yes, flat yes, 0 end yes`; `?` = no answer for that point | disabled, diagnostic |
 | Sensor refresh interval | minutes between sensor-only connections, `1`–`1440` (24 h) | `10`, config |
 
 The disabled entities can be enabled from the device page in Home Assistant.

@@ -256,6 +256,31 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'true'
+  # Check calibration button: on the next connection, ask the motor over
+  # 00001407 for its direction and the state of each calibration point.
+  # rx_cccd = (CCCD handle << 16) | value for 00001407; rx_nores = write it
+  # without response. cal_res holds one byte per point (0 direction, 1 TOP,
+  # 2 MIDDLE, 3 BOTTOM), 0xFF = no answer; cal_i is the point being asked.
+  - id: ${blind_id}_cal_check
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ${blind_id}_rx_cccd
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: ${blind_id}_rx_nores
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ${blind_id}_cal_res
+    type: uint32_t
+    restore_value: false
+    initial_value: '0xFFFFFFFF'
+  - id: ${blind_id}_cal_i
+    type: int
+    restore_value: false
+    initial_value: '0'
   # Read pairing key button: read 00001409 on the next connection, before the
   # key is written; key_got is set once the read answered.
   - id: ${blind_id}_key_read
@@ -302,11 +327,14 @@ ble_client:
             // 128-bit UUIDs in the stack's little-endian layout; bytes 12-13
             // hold the 16-bit short ID (0x1651 etc.).
             // The fourth, 00001409 (passkey), is only read on request (the
-            // Read pairing key button), never subscribed.
-            static const uint16_t shorts[4] = {0x1651, 0x1402, 0x1403, 0x1409};
-            std::vector<uint16_t> handles(4, 0);
+            // Read pairing key button), never subscribed. The fifth, 00001407
+            // (command channel), is only subscribed for the Check
+            // calibration button; its CCCD is kept in rx_cccd.
+            static const uint16_t shorts[5] = {0x1651, 0x1402, 0x1403, 0x1409, 0x1407};
+            std::vector<uint16_t> handles(5, 0);
             std::vector<uint32_t> cccds;
-            for (int i = 0; i < 4; i++) {
+            id(${blind_id}_rx_cccd) = 0;
+            for (int i = 0; i < 5; i++) {
               esp_bt_uuid_t uuid = {};
               uuid.len = ESP_UUID_LEN_128;
               const uint8_t base[16] = {0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x00, 0x16,
@@ -334,6 +362,12 @@ ble_client:
                 continue;
               }
               uint16_t en = (chr.properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) ? 0x0002 : 0x0001;
+              if (i == 4) {
+                id(${blind_id}_rx_cccd) = ((uint32_t) descr.handle << 16) | en;
+                id(${blind_id}_rx_nores) = !(chr.properties & ESP_GATT_CHAR_PROP_BIT_WRITE) &&
+                                           (chr.properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR);
+                continue;
+              }
               cccds.push_back(((uint32_t) descr.handle << 16) | en);
               expect |= 1 << i;
               // Tells the local stack to deliver indications for this handle.
@@ -534,6 +568,68 @@ script:
                                               open, close, (uint8_t) (temp & 0xFF), (uint8_t) ((uint16_t) temp >> 8),
                                               pos, flags, 30, 0};
             - delay: 200ms
+      # 2f. Check calibration button (read only): subscribe to 00001407 and
+      #     send the official app's GET command (60 01 <point>) for the
+      #     direction and for each calibration point. The decoder below
+      #     stores the answers; nothing moves and nothing is changed.
+      - if:
+          condition:
+            lambda: |-
+              return id(${blind_id}_cal_check) && id(${blind_id}_handles)[4] != 0 && id(${blind_id}_rx_cccd) != 0;
+          then:
+            - lambda: |-
+                id(${blind_id}_cal_check) = false;
+                id(${blind_id}_cal_res) = 0xFFFFFFFF;
+                id(${blind_id}_cal_i) = 0;
+                uint16_t h = id(${blind_id}_handles)[4];
+                id(${blind_id}_rx_raw)->handle = h;
+                auto *cl = id(${blind_id}_ble);
+                cl->register_for_notify(h);
+                uint32_t c = id(${blind_id}_rx_cccd);
+                uint8_t value[2] = {(uint8_t) (c & 0xFF), 0x00};
+                esp_err_t err = esp_ble_gattc_write_char_descr(cl->get_gattc_if(), cl->get_conn_id(), c >> 16,
+                                                               sizeof(value), value, ESP_GATT_WRITE_TYPE_RSP,
+                                                               ESP_GATT_AUTH_REQ_NONE);
+                if (err != ESP_OK) ESP_LOGW("${blind_id}", "Enabling indications on 0x1407 failed: %d", err);
+                ESP_LOGI("${blind_id}", "Checking calibration (read only)");
+            - delay: 300ms
+            - repeat:
+                count: 4
+                then:
+                  - lambda: |-
+                      int p = id(${blind_id}_cal_i);
+                      uint8_t cmd[3] = {0x60, 0x01, (uint8_t) p};
+                      auto *cl = id(${blind_id}_ble);
+                      esp_err_t err = esp_ble_gattc_write_char(
+                          cl->get_gattc_if(), cl->get_conn_id(), id(${blind_id}_handles)[4], sizeof(cmd), cmd,
+                          id(${blind_id}_rx_nores) ? ESP_GATT_WRITE_TYPE_NO_RSP : ESP_GATT_WRITE_TYPE_RSP,
+                          ESP_GATT_AUTH_REQ_NONE);
+                      if (err != ESP_OK) ESP_LOGW("${blind_id}", "Writing 0x1407 failed: %d", err);
+                  - wait_until:
+                      condition:
+                        lambda: |-
+                          return ((id(${blind_id}_cal_res) >> (8 * id(${blind_id}_cal_i))) & 0xFF) != 0xFF;
+                      timeout: 1500ms
+                  - lambda: 'id(${blind_id}_cal_i)++;'
+                  - delay: 100ms
+            - lambda: |-
+                uint32_t r = id(${blind_id}_cal_res);
+                auto b = [r](int p) { return (int) ((r >> (8 * p)) & 0xFF); };
+                if (r == 0xFFFFFFFF) {
+                  id(${blind_id}_cal_text).publish_state("no answer");
+                  ESP_LOGW("${blind_id}", "Calibration check: the motor did not answer on 0x1407");
+                  return;
+                }
+                auto state = [&b](int p) -> std::string {
+                  int v = b(p);
+                  return v == 0xFF ? "?" : v == 1 ? "yes" : v == 0 ? "no" : std::to_string(v);
+                };
+                int d = b(0);
+                std::string s = std::string("direction ") +
+                                (d == 0xFF ? "?" : d == 0 ? "normal" : d == 1 ? "reversed" : std::to_string(d)) +
+                                ", 200 end " + state(1) + ", flat " + state(2) + ", 0 end " + state(3);
+                id(${blind_id}_cal_text).publish_state(s);
+                ESP_LOGI("${blind_id}", "Calibration check: %s", s.c_str());
       # 3. Moves. Loops, so a command that arrives while connected (e.g. one
       #    interrupting a silent move) is handled on this same connection.
       - while:
@@ -988,6 +1084,28 @@ sensor:
       id(${blind_id}_got) |= 4;
       return NAN;
 
+  # 00001407 (command channel) answers, only subscribed for the Check
+  # calibration button. A GET answer is 60 <len> <point> <value>; ACK / NACK
+  # answers start with 01 / 00 and name the command in byte 2.
+  - platform: ble_client
+    type: characteristic
+    id: ${blind_id}_rx_raw
+    internal: true
+    ble_client_id: ${blind_id}_ble
+    service_uuid: '00001400-1212-efde-1600-785feabcd123'
+    characteristic_uuid: '00001407-1212-efde-1600-785feabcd123'
+    update_interval: never
+    lambda: |-
+      if (!id(${blind_id}_authed) || x.empty()) return NAN;
+      ESP_LOGI("${blind_id}", "0x1407: %s", format_hex_pretty(x).c_str());
+      if (x[0] == 0x60 && x.size() >= 4 && x[2] < 4) {
+        uint32_t shift = 8 * x[2];
+        id(${blind_id}_cal_res) = (id(${blind_id}_cal_res) & ~(0xFFUL << shift)) | ((uint32_t) x[3] << shift);
+      } else if (x[0] == 0x00) {
+        ESP_LOGW("${blind_id}", "0x1407: the motor refused command 0x%02X", x.size() > 2 ? x[2] : 0);
+      }
+      return NAN;
+
   # 00001409 (passkey), read only when the Read pairing key button asks for
   # it. Logs every byte and shows the first six, formatted for blind_key.
   - platform: ble_client
@@ -1163,6 +1281,15 @@ binary_sensor:
     entity_category: diagnostic
 
 text_sensor:
+  # What the Check calibration button got, e.g. "direction normal, 200 end
+  # yes, flat yes, 0 end yes" ("?" = no answer for that point).
+  - platform: template
+    id: ${blind_id}_cal_text
+    name: "${blind_name} Calibration check"
+    icon: mdi:tune-vertical-variant
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: never
   # What the Read pairing key button got from 00001409: the first six bytes,
   # formatted like blind_key.
   - platform: template
@@ -1188,6 +1315,18 @@ button:
     icon: mdi:refresh
     entity_category: diagnostic
     on_press:
+      - script.execute: ${blind_id}_refresh
+  # Diagnostic: on the next connection, ask the motor for its calibration
+  # (direction and the 0 / flat / 200 points) and show the answer in
+  # "Calibration check". Read only: nothing moves and nothing is changed.
+  - platform: template
+    id: ${blind_id}_check_cal_button
+    name: "${blind_name} Check calibration"
+    icon: mdi:tune-vertical-variant
+    entity_category: diagnostic
+    disabled_by_default: true
+    on_press:
+      - lambda: 'id(${blind_id}_cal_check) = true;'
       - script.execute: ${blind_id}_refresh
   # Diagnostic: on the next connection, read the motor's passkey characteristic
   # before unlocking and show the result in "Pairing key read" (and the log).
