@@ -256,6 +256,16 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'true'
+  # Read the version info (00001404) on the next connection: set at boot
+  # (versions don't change while running) and by the Read versions button.
+  - id: ${blind_id}_ver_read
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  - id: ${blind_id}_ver_got
+    type: bool
+    restore_value: false
+    initial_value: 'false'
   # Check calibration button: on the next connection, ask the motor over
   # 00001407 for its direction and the state of each calibration point.
   # rx_cccd = (CCCD handle << 16) | value for 00001407; rx_nores = write it
@@ -329,12 +339,13 @@ ble_client:
             // The fourth, 00001409 (passkey), is only read on request (the
             // Read pairing key button), never subscribed. The fifth, 00001407
             // (command channel), is only subscribed for the Check
-            // calibration button; its CCCD is kept in rx_cccd.
-            static const uint16_t shorts[5] = {0x1651, 0x1402, 0x1403, 0x1409, 0x1407};
-            std::vector<uint16_t> handles(5, 0);
+            // calibration button; its CCCD is kept in rx_cccd. The sixth,
+            // 00001404 (version info), is only read (once per boot).
+            static const uint16_t shorts[6] = {0x1651, 0x1402, 0x1403, 0x1409, 0x1407, 0x1404};
+            std::vector<uint16_t> handles(6, 0);
             std::vector<uint32_t> cccds;
             id(${blind_id}_rx_cccd) = 0;
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 6; i++) {
               esp_bt_uuid_t uuid = {};
               uuid.len = ESP_UUID_LEN_128;
               const uint8_t base[16] = {0x23, 0xd1, 0xbc, 0xea, 0x5f, 0x78, 0x00, 0x16,
@@ -350,7 +361,7 @@ ble_client:
                 continue;
               }
               handles[i] = chr.char_handle;
-              if (i == 3) continue;
+              if (i == 3 || i == 5) continue;
               esp_bt_uuid_t cccd_uuid = {};
               cccd_uuid.len = ESP_UUID_LEN_16;
               cccd_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
@@ -568,6 +579,26 @@ script:
                                               open, close, (uint8_t) (temp & 0xFF), (uint8_t) ((uint16_t) temp >> 8),
                                               pos, flags, 30, 0};
             - delay: 200ms
+      # 2f'. Version info (00001404), once per boot or on request (read only).
+      - if:
+          condition:
+            lambda: 'return id(${blind_id}_ver_read) && id(${blind_id}_handles)[5] != 0;'
+          then:
+            - lambda: |-
+                id(${blind_id}_ver_read) = false;
+                id(${blind_id}_ver_got) = false;
+                uint16_t h = id(${blind_id}_handles)[5];
+                id(${blind_id}_ver_raw)->handle = h;
+                auto *cl = id(${blind_id}_ble);
+                esp_err_t err = esp_ble_gattc_read_char(cl->get_gattc_if(), cl->get_conn_id(), h, ESP_GATT_AUTH_REQ_NONE);
+                if (err != ESP_OK) {
+                  ESP_LOGW("${blind_id}", "Reading 0x1404 failed: %d", err);
+                  id(${blind_id}_ver_got) = true;
+                }
+            - wait_until:
+                condition:
+                  lambda: 'return id(${blind_id}_ver_got);'
+                timeout: 2s
       # 2f. Check calibration button (read only): subscribe to 00001407 and
       #     send the official app's GET command (60 01 <point>) for the
       #     direction and for each calibration point. The decoder below
@@ -1106,6 +1137,34 @@ sensor:
       }
       return NAN;
 
+  # 00001404 (version info, 20 bytes), read once per boot. Layout from the
+  # official app: hash (u32), hardware type major/minor, hardware version,
+  # protocol version, package, MCU app, MCU bootloader, BLE app (each
+  # major/minor), BLE stack ID (u16), BLE DFU major/minor.
+  - platform: ble_client
+    type: characteristic
+    id: ${blind_id}_ver_raw
+    internal: true
+    ble_client_id: ${blind_id}_ble
+    service_uuid: '00001400-1212-efde-1600-785feabcd123'
+    characteristic_uuid: '00001404-1212-efde-1600-785feabcd123'
+    update_interval: never
+    lambda: |-
+      if (id(${blind_id}_ver_got)) return NAN;
+      id(${blind_id}_ver_got) = true;
+      ESP_LOGI("${blind_id}", "0x1404 (read): %s", format_hex_pretty(x).c_str());
+      if (x.size() < 20) {
+        ESP_LOGW("${blind_id}", "0x1404: expected 20 bytes, got %u", (unsigned) x.size());
+        return NAN;
+      }
+      char buf[160];
+      snprintf(buf, sizeof(buf), "package %u.%u, MCU %u.%u (bootloader %u.%u), BLE %u.%u (DFU %u.%u, stack 0x%04X), hardware %u (type %u.%u), protocol %u",
+               x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15], x[18], x[19],
+               (unsigned) (x[16] | (x[17] << 8)), x[6], x[4], x[5], x[7]);
+      ESP_LOGI("${blind_id}", "Versions: %s", buf);
+      id(${blind_id}_versions).publish_state(buf);
+      return NAN;
+
   # 00001409 (passkey), read only when the Read pairing key button asks for
   # it. Logs every byte and shows the first six, formatted for blind_key.
   - platform: ble_client
@@ -1281,6 +1340,13 @@ binary_sensor:
     entity_category: diagnostic
 
 text_sensor:
+  # Firmware and hardware versions from 00001404, read once per boot.
+  - platform: template
+    id: ${blind_id}_versions
+    name: "${blind_name} Versions"
+    icon: mdi:chip
+    entity_category: diagnostic
+    update_interval: never
   # What the Check calibration button got, e.g. "direction normal, 200 end
   # yes, flat yes, 0 end yes" ("?" = no answer for that point).
   - platform: template
@@ -1315,6 +1381,17 @@ button:
     icon: mdi:refresh
     entity_category: diagnostic
     on_press:
+      - script.execute: ${blind_id}_refresh
+  # Diagnostic: read the versions again on the next connection (they are
+  # read automatically once per boot).
+  - platform: template
+    id: ${blind_id}_read_versions_button
+    name: "${blind_name} Read versions"
+    icon: mdi:chip
+    entity_category: diagnostic
+    disabled_by_default: true
+    on_press:
+      - lambda: 'id(${blind_id}_ver_read) = true;'
       - script.execute: ${blind_id}_refresh
   # Diagnostic: on the next connection, ask the motor for its calibration
   # (direction and the 0 / flat / 200 points) and show the answer in
