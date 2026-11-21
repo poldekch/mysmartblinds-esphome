@@ -179,6 +179,12 @@ The app's fixed positions are `0`, `50`, `100`, `150` and `200`.
 
 The app retries the read up to 6 times, 200 ms apart, if any field reads 0.
 
+Seen on two first-generation motors (verified): hardware 13 (type 2.1),
+protocol 3, MCU 2.3 (bootloader 1.2), BLE DFU 3.0, BLE stack `0x0065`, and a
+package version of 0.0. The BLE application was 2.0 on an updated motor and
+1.19 on one that had missed an update. The app's public "v2" firmware list
+applies only to hardware 21.
+
 ## 1405 Time
 
 6 bytes:
