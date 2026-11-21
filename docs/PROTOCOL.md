@@ -237,8 +237,11 @@ the other way (`0`).
 | MOVE TO point | `63 01 <point>` | ACK naming `0x63` |
 
 This package's **Check calibration** button sends the four GET commands
-(direction, TOP, MIDDLE, BOTTOM) and logs every answer on `1407`. Not yet
-verified on hardware.
+(direction, TOP, MIDDLE, BOTTOM) and logs every answer on `1407`. Verified on
+two motors: each GET is answered within about 0.3 s by a 20-byte indication,
+`60 02 <point> <value>` padded with `FF`, e.g. `60 02 00 00` (direction
+normal) and `60 02 01 01` (TOP calibrated). A calibrated motor answered
+`0 / 1 / 1 / 1`.
 
 ### The app's calibration screens, in order
 
