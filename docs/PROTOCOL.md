@@ -101,7 +101,12 @@ Bytes 0–3 form a 32-bit little-endian value. The low bits are commands (you se
 them by writing). The upper bits report state (the motor sets them). A direct
 read after the key returns 8 bytes, the flags followed by 4 zero bytes
 (verified). A working, calibrated blind read `0xA0110000`: key valid, paired,
-clock set, calibrated.
+clock set, calibrated; `0xA0150000` while charging from solar.
+
+After a factory reset the motor's clock is not set, and a blind in that state
+reported only zeros (apart from battery %) on `1651`. Its readings came back
+within a day of this package setting the clock (verified on one blind), so the
+motor may only measure while its clock is valid (guess).
 
 | Bit | Mask | Name | Meaning |
 |---|---|---|---|
@@ -113,7 +118,7 @@ clock set, calibrated.
 | 14 | `0x00004000` | ResetFlash | command: **factory reset** |
 | 15 | `0x00008000` | Disconnect | command: disconnect |
 | 16 | `0x00010000` | IsCalibrated | calibrated. When clear, the app shows "needs calibration". |
-| 17 | `0x00020000` | HasSolar | solar panel present according to the app's name. A blind with its panel fitted read `0` at night (verified), so it may really mean "the panel is giving power". |
+| 17 | `0x00020000` | HasSolar | solar panel present according to the app's name, but it stayed `0` on two blinds with fitted panels, at night and while charging in daylight (verified). Meaning unclear. |
 | 18 | `0x00040000` | IsChargingSolar | charging from solar (verified) |
 | 19 | `0x00080000` | IsChargingUSB | charging from USB (verified) |
 | 20 | `0x00100000` | IsTimeValid | the clock has been set |
@@ -346,7 +351,7 @@ too-hot mode is off: once after each ESP boot, and whenever a setting changes.
 | 0 | battery % | % (verified) |
 | 1 | reserved | |
 | 2–3 | battery voltage | mV (guess) |
-| 4–5 | battery charge | raw |
+| 4–5 | battery charge | raw. Probably the charger's output in mV: about 3400–3550 while charging, equal to the solar voltage at night (verified readings) |
 | 6–7 | solar panel voltage | mV (guess) |
 | 8–9 | interior temperature | 0.1 °C (guess). Energy savings compares against this, and its set point is in 0.1 °C. |
 | 10–11 | battery temperature | 0.1 °C (guess) |

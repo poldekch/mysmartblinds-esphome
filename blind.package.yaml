@@ -1130,12 +1130,15 @@ binary_sensor:
     name: "${blind_name} Calibrated"
     icon: mdi:tune-vertical
     entity_category: diagnostic
+  # "HasSolar" in the official app. Hidden: it stayed off on blinds whose
+  # panel was fitted and charging, so its meaning is unclear.
   - platform: template
     id: ${blind_id}_solar_panel
     name: "${blind_name} Solar panel"
     device_class: plug
     icon: mdi:solar-panel
     entity_category: diagnostic
+    disabled_by_default: true
   - platform: template
     id: ${blind_id}_lockout
     name: "${blind_name} Battery lockout"

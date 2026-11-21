@@ -308,11 +308,11 @@ Assistant between connections.
 | Light level (raw) | `00001651` last value, not calibrated to lux | enabled |
 | Battery voltage, Solar panel voltage | `00001651`, assumed mV, shown in V | disabled, diagnostic |
 | Interior temperature, Battery temperature | `00001651`, assumed 0.1 °C, shown in °C | disabled, diagnostic |
-| Battery charge (raw) | `00001651`, unknown units (so far always equal to the solar panel value) | disabled, diagnostic |
+| Battery charge (raw) | `00001651`, unknown units. Probably the charger's output in mV: about 3400–3550 while charging in daylight (near the battery voltage), and equal to the solar panel value at night | disabled, diagnostic |
 | USB charging | `00001402` bit `0x00080000` | disabled, diagnostic |
 | Key accepted | `00001402` bit `0x80000000`: the motor accepted `blind_key` | diagnostic |
 | Calibrated | `00001402` bit `0x00010000` | diagnostic |
-| Solar panel | `00001402` bit `0x00020000`: a solar panel is connected | diagnostic |
+| Solar panel | `00001402` bit `0x00020000` ("HasSolar" in the app). Stayed off on blinds with a fitted, charging panel, so its meaning is unclear | disabled, diagnostic |
 | Battery lockout | `00001402` bit `0x00200000`: battery too low, the motor won't move (not even from the wand) until it charges | diagnostic |
 | Over temperature | `00001402` bit `0x00400000` | diagnostic |
 | Clock set | `00001402` bit `0x00100000`: the motor's clock is valid | diagnostic |
